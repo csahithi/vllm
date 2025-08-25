@@ -18,8 +18,11 @@ from ...utils import RemoteOpenAIServer
 from .test_completion import zephyr_lora_added_tokens_files  # noqa: F401
 from .test_completion import zephyr_lora_files  # noqa: F401
 
+# Use shared model from conftest
+from .conftest import shared_chat_server
+
 # any model with a chat template should work here
-MODEL_NAME = "HuggingFaceH4/zephyr-7b-beta"
+MODEL_NAME = "microsoft/DialoGPT-small"  # Smaller, faster model
 
 
 @pytest.fixture(scope="module")
@@ -40,28 +43,8 @@ def server(
     use_v1 = request.param
     monkeypatch_module.setenv('VLLM_USE_V1', '1' if use_v1 else '0')
 
-    args = [
-        # use half precision for speed and memory savings in CI environment
-        "--dtype",
-        "bfloat16",
-        "--max-model-len",
-        "8192",
-        "--enforce-eager",
-        # lora config below
-        "--enable-lora",
-        "--lora-modules",
-        f"zephyr-lora={zephyr_lora_files}",
-        f"zephyr-lora2={zephyr_lora_added_tokens_files}",
-        "--max-lora-rank",
-        "64",
-        "--max-cpu-loras",
-        "2",
-        "--max-num-seqs",
-        "128",
-    ]
-
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
-        yield remote_server
+    # Use shared server for better performance
+    return shared_chat_server
 
 
 @pytest.fixture

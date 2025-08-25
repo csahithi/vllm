@@ -23,34 +23,13 @@ AUDIO_LORA_PATH = os.path.join(MULTIMODAL_MODEL_NAME, "speech-lora")
 ACTIVE_MM_LORA_RESPONSE = "Spoken text: The first words I spoke in the original chronograph, a little piece of practical poetry. Mary had a little lamb, it slept with quite a snow, and everywhere that Mary went, the lamb was sure to go."  # noqa: E501
 
 
+# Use shared fixtures from conftest
+from .conftest import shared_multimodal_server
+
 @pytest.fixture(scope="module")
 def multimodal_server():  # noqa: F811
-
-    args = [
-        # use half precision for speed and memory savings in CI environment
-        "--dtype",
-        "half",
-        "--max-model-len",
-        "12800",
-        "--enforce-eager",
-        # lora config below
-        "--enable-lora",
-        "--lora-modules",
-        f"speech={AUDIO_LORA_PATH}",
-        "--max-lora-rank",
-        "320",
-        "--max-num-seqs",
-        "2",
-        "--trust-remote-code",
-        "--gpu-memory-utilization",
-        "0.8",
-        "--default-mm-loras",
-        f"{{\"audio\": \"{AUDIO_LORA_PATH}\"}}",
-    ]
-
-    with RemoteOpenAIServer(MULTIMODAL_MODEL_NAME, args,
-                            max_wait_seconds=480) as remote_server:
-        yield remote_server
+    # Use shared server for better performance
+    return shared_multimodal_server
 
 
 @pytest_asyncio.fixture

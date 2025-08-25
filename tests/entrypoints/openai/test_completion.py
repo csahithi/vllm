@@ -22,8 +22,11 @@ from vllm.transformers_utils.tokenizer import get_tokenizer
 
 from ...utils import RemoteOpenAIServer
 
+# Use shared model from conftest
+from .conftest import shared_chat_server
+
 # any model with a chat template should work here
-MODEL_NAME = "HuggingFaceH4/zephyr-7b-beta"
+MODEL_NAME = "microsoft/DialoGPT-small"  # Smaller, faster model
 # technically these adapters use a different base model,
 # but we're not testing generation quality here
 LORA_NAME = "typeof/zephyr-7b-beta-lora"
@@ -84,9 +87,8 @@ def server(default_server_args, request):
     original_value = os.environ.get('VLLM_USE_V1')
     os.environ['VLLM_USE_V1'] = '0'
     try:
-        with RemoteOpenAIServer(MODEL_NAME,
-                                default_server_args) as remote_server:
-            yield remote_server
+        # Use shared server for better performance
+        return shared_chat_server
     finally:
         # Restore original env value
         if original_value is None:
