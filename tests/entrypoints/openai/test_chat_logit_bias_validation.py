@@ -7,9 +7,7 @@ import pytest_asyncio
 
 from vllm.config import ModelConfig
 
-from .conftest import server_factory
-
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
 
 
 def get_vocab_size(model_name):
@@ -22,7 +20,7 @@ def get_vocab_size(model_name):
 
 
 @pytest.fixture(scope="module")
-def server():
+def server(server_factory):
     # Use server_factory with custom args for logit bias validation
     custom_args = [
         "--dtype", "bfloat16",
