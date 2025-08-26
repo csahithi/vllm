@@ -69,11 +69,11 @@ def download_model_once(model_name, cache_dir):
 import threading
 
 class DynamicModelServer:
-    """Single server that can switch between different models."""
+    """Smart server that caches models separately from server configurations."""
     
     def __init__(self):
-        self.current_model = None
-        self.current_server = None
+        self.model_cache = {}  # model_name -> cached_path
+        self.server_cache = {}  # (model_name, args_hash) -> server_instance
         self.cache_dir = get_model_cache_dir()
         self._lock = threading.Lock()  # Thread safety for parallel workers
         
@@ -83,19 +83,27 @@ class DynamicModelServer:
         Args:
             model_name: HuggingFace model name or path
             server_args: Custom server arguments (optional)
-            model_type: Type for default args (optional, e.g., 'chat', 'embedding')
+            model_type: Type for default args (optional, e.g., 'tiny_model', 'embedding')
         """
         # Create a unique key for this model+args combination
-        model_key = f"{model_name}_{hash(str(server_args))}"
+        args_hash = hash(str(server_args) if server_args else str(model_type))
+        server_key = (model_name, args_hash)
         
         with self._lock:  # Thread-safe access
-            if self.current_model == model_key and self.current_server is not None:
-                return self.current_server
+            # Check if we already have this exact server configuration
+            if server_key in self.server_cache:
+                print(f"✅ Reusing existing server for {model_name} with args hash {args_hash}")
+                return self.server_cache[server_key]
             
-            # Close existing server if switching models
-            if self.current_server is not None:
-                print(f"🔄 Switching from {self.current_model} to {model_key}")
-                self.current_server.__exit__(None, None, None)
+            # Check if we already have this model downloaded
+            if model_name in self.model_cache:
+                cached_model_path = self.model_cache[model_name]
+                print(f"✅ Reusing cached model: {model_name}")
+            else:
+                # Download and cache model (only once per model name)
+                cached_model_path = download_model_once(model_name, self.cache_dir)
+                self.model_cache[model_name] = cached_model_path
+                print(f"📥 Downloaded and cached model: {model_name}")
             
             # Use custom args or default args based on model type
             if server_args is None and model_type in DEFAULT_ARGS:
@@ -106,7 +114,7 @@ class DynamicModelServer:
             else:
                 args = server_args.copy()
             
-            # Add memory optimization flags
+            # Add memory optimization flags if not already present
             memory_flags = [
                 "--gpu-memory-utilization", "0.7",  # Use only 70% of GPU memory
                 "--max-model-len", "1024",  # Reduce from 2048 to save memory
@@ -116,24 +124,35 @@ class DynamicModelServer:
             ]
             
             # Merge memory flags with existing args
-            for flag in memory_flags:
+            for i in range(0, len(memory_flags), 2):
+                flag = memory_flags[i]
+                value = memory_flags[i + 1]
                 if flag not in args:
                     args.append(flag)
-            
-            # Download and cache model
-            cached_model_path = download_model_once(model_name, self.cache_dir)
+                    args.append(value)
             
             # Create new server
-            print(f"🚀 Starting server for model: {model_name}")
-            self.current_server = RemoteOpenAIServer(cached_model_path, args, max_wait_seconds=120)
-            self.current_model = model_key
+            print(f"🚀 Starting server for {model_name} with args hash {args_hash}")
+            new_server = RemoteOpenAIServer(cached_model_path, args, max_wait_seconds=120)
             
-            return self.current_server
+            # Cache the server instance
+            self.server_cache[server_key] = new_server
+            
+            return new_server
     
     def cleanup(self):
         """Clean up all resources."""
-        if self.current_server is not None:
-            self.current_server.__exit__(None, None, None)
+        # Clean up all server instances
+        for server_key, server in self.server_cache.items():
+            print(f"🧹 Cleaning up server for {server_key}")
+            try:
+                server.__exit__(None, None, None)
+            except Exception as e:
+                print(f"⚠️ Warning: Error cleaning up server {server_key}: {e}")
+        
+        # Clear caches
+        self.server_cache.clear()
+        self.model_cache.clear()
         
         # Optionally clean up cache (comment out to keep models between test runs)
         # if MODEL_CACHE_DIR and os.path.exists(MODEL_CACHE_DIR):
@@ -149,22 +168,40 @@ def get_dynamic_server():
         _dynamic_server = DynamicModelServer()
     return _dynamic_server
 
-# Removed helper functions - no longer needed with server_factory approach
-
-# Removed individual server fixtures - use server_factory instead for flexibility
+# Session-scoped server fixtures for maximum efficiency (single worker)
+@pytest.fixture(scope="session")
+def server():
+    """Session-scoped server with tiny model - ALL test files share this server."""
+    server = get_dynamic_server()
+    return server.get_server("hmellor/tiny-random-LlamaForCausalLM", model_type="tiny_model")
 
 @pytest.fixture(scope="session")
-def dynamic_server():
-    """Direct access to the dynamic server for advanced usage."""
-    return get_dynamic_server()
+def embedding_server():
+    """Session-scoped embedding server - ALL embedding tests share this server."""
+    server = get_dynamic_server()
+    return server.get_server("intfloat/multilingual-e5-small", model_type="embedding")
 
+# Additional session-scoped fixtures for specialized tests
+@pytest.fixture(scope="session")
+def vision_server():
+    """Session-scoped vision server for multimodal tests."""
+    server = get_dynamic_server()
+    return server.get_server("microsoft/Phi-3.5-vision-instruct", model_type="vision")
+
+@pytest.fixture(scope="session")
+def audio_server():
+    """Session-scoped audio server for audio processing tests."""
+    server = get_dynamic_server()
+    return server.get_server("fixie-ai/ultravox-v0_5-llama-3_2-1b", model_type="audio")
+
+# Factory fixture for advanced usage
 @pytest.fixture(scope="session")
 def server_factory():
     """Factory fixture for creating servers with custom models and args.
     
     Usage:
         def test_my_model(server_factory):
-            server = server_factory("my/model", model_type="chat")
+            server = server_factory("my/model", model_type="tiny_model")
             # or
             server = server_factory("my/model", server_args=["--custom", "args"])
     """
@@ -172,28 +209,6 @@ def server_factory():
         server = get_dynamic_server()
         return server.get_server(model_name, server_args, model_type)
     return create_server
-
-# Session-scoped server fixtures for maximum efficiency (single worker)
-@pytest.fixture(scope="session")
-def server(server_factory):
-    """Session-scoped server with tiny model - ALL test files share this server."""
-    return server_factory("hmellor/tiny-random-LlamaForCausalLM", model_type="tiny_model")
-
-@pytest.fixture(scope="session")
-def embedding_server(server_factory):
-    """Session-scoped embedding server - ALL embedding tests share this server."""
-    return server_factory("intfloat/multilingual-e5-small", model_type="embedding")
-
-# Additional session-scoped fixtures for specialized tests
-@pytest.fixture(scope="session")
-def vision_server(server_factory):
-    """Session-scoped vision server for multimodal tests."""
-    return server_factory("microsoft/Phi-3.5-vision-instruct", model_type="vision")
-
-@pytest.fixture(scope="session")
-def audio_server(server_factory):
-    """Session-scoped audio server for audio processing tests."""
-    return server_factory("fixie-ai/ultravox-v0_5-llama-3_2-1b", model_type="audio")
 
 # Cleanup fixture
 @pytest.fixture(scope="session", autouse=True)
