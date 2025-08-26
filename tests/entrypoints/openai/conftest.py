@@ -8,14 +8,29 @@ import shutil
 from pathlib import Path
 from ...utils import RemoteOpenAIServer
 
-# Default server arguments for common configurations (memory-optimized)
+# Optimized server arguments for test groups (maximizing compatibility)
+# 
+# SESSION-SCOPED STRATEGY (Single Worker):
+# 1. All tests share the same server instances (session-scoped)
+# 2. Maximum model reuse - no model switching between tests
+# 3. Single worker execution - no race conditions or conflicts
+# 4. Tests are stateless - safe to share servers
+#
 DEFAULT_ARGS = {
-    "chat": ["--dtype", "bfloat16", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "32", "--gpu-memory-utilization", "0.7", "--disable-log-stats", "--disable-log-requests", "--disable-log-errors", "--max-paddings", "32"],
-    "embedding": ["--runner", "pooling", "--dtype", "bfloat16", "--enforce-eager", "--max-model-len", "512", "--gpu-memory-utilization", "0.7", "--disable-log-stats", "--disable-log-requests", "--disable-log-errors", "--max-paddings", "16"],
-    "vision": ["--runner", "generate", "--dtype", "bfloat16", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "4", "--gpu-memory-utilization", "0.7", "--trust-remote-code", "--limit-mm-per-prompt", '{"image": 2}', "--disable-log-stats", "--disable-log-requests", "--disable-log-errors"],
-    "audio": ["--dtype", "float32", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "4", "--gpu-memory-utilization", "0.7", "--trust-remote-code", "--limit-mm-per-prompt", '{"audio": 2}', "--disable-log-stats", "--disable-log-requests", "--disable-log-errors"],
-    "video": ["--runner", "generate", "--dtype", "bfloat16", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "4", "--gpu-memory-utilization", "0.7", "--trust-remote-code", "--limit-mm-per-prompt", '{"video": 1}', "--disable-log-stats", "--disable-log-requests", "--disable-log-errors"],
-    "multimodal": ["--dtype", "bfloat16", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "16", "--gpu-memory-utilization", "0.7", "--disable-log-stats", "--disable-log-requests", "--disable-log-errors", "--max-paddings", "8"]
+    # Group 1: Tiny Model Tests (Most Compatible) - 11 test files can share this
+    # Tests: test_chat.py, test_completion.py, test_basic.py, test_uds.py, test_chunked_prompt.py, 
+    #        test_sleep.py, test_shutdown.py, test_metrics.py, test_root_path.py, test_chat_echo.py, test_chat_logit_bias_validation.py
+    "tiny_model": ["--dtype", "bfloat16", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "32", "--gpu-memory-utilization", "0.7", "--disable-log-stats", "--disable-log-requests"],
+    
+    # Group 2: Embedding Tests - 3 test files can share this
+    # Tests: test_embedding.py, test_embedding_long_text.py, test_optional_middleware.py
+    "embedding": ["--runner", "pooling", "--dtype", "bfloat16", "--enforce-eager", "--max-model-len", "512", "--gpu-memory-utilization", "0.7", "--disable-log-stats", "--disable-log-requests"],
+    
+    # Group 3: Specialized Tests (Keep Separate) - Individual configurations
+    "vision": ["--runner", "generate", "--dtype", "bfloat16", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "4", "--gpu-memory-utilization", "0.7", "--trust-remote-code", "--limit-mm-per-prompt", '{"image": 2}', "--disable-log-stats", "--disable-log-requests"],
+    "audio": ["--dtype", "float32", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "4", "--gpu-memory-utilization", "0.7", "--trust-remote-code", "--limit-mm-per-prompt", '{"audio": 2}', "--disable-log-stats", "--disable-log-requests"],
+    "video": ["--runner", "generate", "--dtype", "bfloat16", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "4", "--gpu-memory-utilization", "0.7", "--trust-remote-code", "--limit-mm-per-prompt", '{"video": 1}', "--disable-log-stats", "--disable-log-requests"],
+    "multimodal": ["--dtype", "bfloat16", "--max-model-len", "1024", "--enforce-eager", "--max-num-seqs", "16", "--gpu-memory-utilization", "0.7", "--disable-log-stats", "--disable-log-requests"]
 }
 
 # Global model cache directory
@@ -96,8 +111,7 @@ class DynamicModelServer:
                 "--max-model-len", "1024",  # Reduce from 2048 to save memory
                 "--max-num-seqs", "32",     # Reduce from 64 to save memory
                 "--disable-log-stats",
-                "--disable-log-requests",
-                "--disable-log-errors"
+                "--disable-log-requests"
             ]
             
             # Merge memory flags with existing args
@@ -158,16 +172,27 @@ def server_factory():
         return server.get_server(model_name, server_args, model_type)
     return create_server
 
-# Backward compatibility fixtures
-@pytest.fixture(scope="module")
+# Session-scoped server fixtures for maximum efficiency (single worker)
+@pytest.fixture(scope="session")
 def server(server_factory):
-    """Backward compatibility - creates server with default chat model."""
-    return server_factory("hmellor/tiny-random-LlamaForCausalLM", model_type="chat")
+    """Session-scoped server with tiny model - ALL test files share this server."""
+    return server_factory("hmellor/tiny-random-LlamaForCausalLM", model_type="tiny_model")
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def embedding_server(server_factory):
-    """Backward compatibility - creates server with default embedding model."""
+    """Session-scoped embedding server - ALL embedding tests share this server."""
     return server_factory("intfloat/multilingual-e5-small", model_type="embedding")
+
+# Additional session-scoped fixtures for specialized tests
+@pytest.fixture(scope="session")
+def vision_server(server_factory):
+    """Session-scoped vision server for multimodal tests."""
+    return server_factory("microsoft/Phi-3.5-vision-instruct", model_type="vision")
+
+@pytest.fixture(scope="session")
+def audio_server(server_factory):
+    """Session-scoped audio server for audio processing tests."""
+    return server_factory("fixie-ai/ultravox-v0_5-llama-3_2-1b", model_type="audio")
 
 # Cleanup fixture
 @pytest.fixture(scope="session", autouse=True)

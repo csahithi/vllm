@@ -11,19 +11,8 @@ import pytest_asyncio
 MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
 
 
-@pytest.fixture(scope="module")
-def server(server_factory):
-    # Use server_factory with custom args for this specific test
-    custom_args = [
-        # use half precision for speed and memory savings in CI environment
-        "--dtype", "float16",
-        "--enforce-eager",
-        "--max-model-len", "1024",  # Reduced for tiny model
-        "--disable-log-stats",
-        "--disable-log-requests"
-    ]
-    
-    return server_factory(MODEL_NAME, server_args=custom_args)
+# Use the session-scoped server fixture from conftest directly
+# The server fixture already has optimized args for tiny models
 
 
 @pytest_asyncio.fixture

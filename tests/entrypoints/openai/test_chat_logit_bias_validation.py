@@ -19,18 +19,8 @@ def get_vocab_size(model_name):
     return config.get_vocab_size()
 
 
-@pytest.fixture(scope="module")
-def server(server_factory):
-    # Use server_factory with custom args for logit bias validation
-    custom_args = [
-        "--dtype", "bfloat16",
-        "--max-model-len", "1024",
-        "--enforce-eager",
-        "--disable-log-stats",
-        "--disable-log-requests"
-    ]
-    
-    return server_factory(MODEL_NAME, server_args=custom_args)
+# Use the session-scoped server fixture from conftest directly
+# The server fixture already has optimized args for tiny models
 
 
 @pytest_asyncio.fixture
