@@ -7,7 +7,7 @@ import pytest_asyncio
 
 from vllm.config import ModelConfig
 
-from ...utils import RemoteOpenAIServer
+from .conftest import server_factory
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
@@ -23,16 +23,16 @@ def get_vocab_size(model_name):
 
 @pytest.fixture(scope="module")
 def server():
-    args = [
-        "--dtype",
-        "bfloat16",
-        "--max-model-len",
-        "1024",
+    # Use server_factory with custom args for logit bias validation
+    custom_args = [
+        "--dtype", "bfloat16",
+        "--max-model-len", "1024",
         "--enforce-eager",
+        "--disable-log-stats",
+        "--disable-log-requests"
     ]
-
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
-        yield remote_server
+    
+    return server_factory(MODEL_NAME, server_args=custom_args)
 
 
 @pytest_asyncio.fixture

@@ -7,7 +7,7 @@ import openai  # use the official client for correctness check
 import pytest
 import pytest_asyncio
 
-from ...utils import RemoteOpenAIServer
+from .conftest import server_factory
 
 # # any model with a chat template should work here
 MODEL_NAME = "Qwen/Qwen2-1.5B-Instruct"
@@ -15,17 +15,17 @@ MODEL_NAME = "Qwen/Qwen2-1.5B-Instruct"
 
 @pytest.fixture(scope="module")
 def server():
-    args = [
+    # Use server_factory with custom args for this specific test
+    custom_args = [
         # use half precision for speed and memory savings in CI environment
-        "--dtype",
-        "float16",
+        "--dtype", "float16",
         "--enforce-eager",
-        "--max-model-len",
-        "4080",
+        "--max-model-len", "4080",
+        "--disable-log-stats",
+        "--disable-log-requests"
     ]
-
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
-        yield remote_server
+    
+    return server_factory(MODEL_NAME, server_args=custom_args)
 
 
 @pytest_asyncio.fixture
