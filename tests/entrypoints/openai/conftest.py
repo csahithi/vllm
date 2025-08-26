@@ -62,7 +62,8 @@ def download_model_once(model_name, cache_dir):
         return model_path
     except Exception as e:
         print(f"❌ Failed to download {model_name}: {e}")
-        # Fallback to original model name
+        # Fallback to original model name - this should work for local models
+        print(f"🔄 Falling back to original model name: {model_name}")
         return model_name
 
 import threading
@@ -100,8 +101,8 @@ class DynamicModelServer:
             if server_args is None and model_type in DEFAULT_ARGS:
                 args = DEFAULT_ARGS[model_type].copy()
             elif server_args is None:
-                # Default to chat args for unknown model types
-                args = DEFAULT_ARGS["chat"].copy()
+                # Default to tiny_model args for unknown model types
+                args = DEFAULT_ARGS["tiny_model"].copy()
             else:
                 args = server_args.copy()
             
