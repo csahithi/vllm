@@ -20,10 +20,11 @@ from transformers import AutoTokenizer
 
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
+from .conftest import server as shared_server  # Import the shared server
 
 # any model with a chat template should work here
-MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
+MODEL_NAME = "microsoft/DialoGPT-small"  # Compatible model for testing
 # technically these adapters use a different base model,
 # but we're not testing generation quality here
 LORA_NAME = "typeof/zephyr-7b-beta-lora"
@@ -53,17 +54,13 @@ def zephyr_lora_added_tokens_files(zephyr_lora_files):
 
 
 @pytest.fixture(scope="module")
-def default_server_args(zephyr_lora_files, zephyr_lora_added_tokens_files):
-    return [
-        # use half precision for speed and memory savings in CI environment
-        "--dtype",
-        "bfloat16",
-        "--max-model-len",
-        "8192",
-        "--max-num-seqs",
-        "128",
+def lora_server(zephyr_lora_files, zephyr_lora_added_tokens_files):
+    """Custom server for LoRA model tests."""
+    args = [
+        "--dtype", "bfloat16",
+        "--max-model-len", "8192",
+        "--max-num-seqs", "128",
         "--enforce-eager",
-        # lora config
         "--enable-lora",
         "--lora-modules",
         f"zephyr-lora={zephyr_lora_files}",
@@ -73,10 +70,28 @@ def default_server_args(zephyr_lora_files, zephyr_lora_added_tokens_files):
         "--max-cpu-loras",
         "2",
     ]
+    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+        yield remote_server
 
 
-# Use the session-scoped server fixture from conftest directly
-# No need for custom server fixture since we're using session-scoped
+@pytest.fixture
+def server(request):
+    """Smart server selection: use shared server for base model, custom server for LoRA.
+    
+    This fixture intelligently selects between:
+    - shared_server: For base model tests (MODEL_NAME)
+    - lora_server: For LoRA model tests (zephyr-lora, zephyr-lora2)
+    
+    This maximizes server reuse while maintaining specialized LoRA functionality.
+    """
+    model_name = request.getfixturevalue("model_name")
+    if model_name == MODEL_NAME:
+        # Use shared server for base model tests
+        return shared_server
+    else:
+        # Use custom server for LoRA model tests
+        return request.getfixturevalue("lora_server")
+
 
 @pytest.fixture(scope="session",
                 params=["", "--disable-frontend-multiprocessing"])
