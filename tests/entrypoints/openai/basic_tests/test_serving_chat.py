@@ -17,7 +17,7 @@ from vllm.entrypoints.openai.serving_models import (BaseModelPath,
                                                     OpenAIServingModels)
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-MODEL_NAME = "openai-community/gpt2"
+MODEL_NAME = "microsoft/DialoGPT-small"
 CHAT_TEMPLATE = "Dummy chat template for testing {}"
 BASE_MODEL_PATHS = [BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME)]
 

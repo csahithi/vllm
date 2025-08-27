@@ -4,9 +4,9 @@
 import openai
 import pytest
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
-MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
+MODEL_NAME = "microsoft/DialoGPT-small"  # Compatible model for testing
 
 
 @pytest.mark.asyncio

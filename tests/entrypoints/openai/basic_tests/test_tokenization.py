@@ -8,16 +8,18 @@ import requests
 
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 from .test_completion import zephyr_lora_added_tokens_files  # noqa: F401
 from .test_completion import zephyr_lora_files  # noqa: F401
+from .conftest import server as shared_server
 
 # Use tiny model for faster testing
-MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
+MODEL_NAME = "microsoft/DialoGPT-small"
 
 
 @pytest.fixture(scope="module")
-def server(zephyr_lora_added_tokens_files: str):  # noqa: F811
+def lora_server(zephyr_lora_added_tokens_files: str):
+    """Custom server for LoRA model tests."""
     args = [
         # use half precision for speed and memory savings in CI environment
         "--dtype",
@@ -38,6 +40,18 @@ def server(zephyr_lora_added_tokens_files: str):  # noqa: F811
 
     with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
         yield remote_server
+
+
+@pytest.fixture
+def server(request):
+    """Smart server selection: use shared server for base model, custom server for LoRA."""
+    model_name = request.getfixturevalue("model_name")
+    if model_name == MODEL_NAME:
+        # Use shared server for base model tests
+        return shared_server
+    else:
+        # Use custom server for LoRA model tests
+        return request.getfixturevalue("lora_server")
 
 
 @pytest.fixture(scope="module")
