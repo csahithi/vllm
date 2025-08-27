@@ -19,28 +19,38 @@ MODEL_NAME = "intfloat/multilingual-e5-small"
 
 
 @pytest.fixture(scope="module")
-def server(request: pytest.FixtureRequest):
+def server(request: pytest.FixtureRequest, embedding_server):
+    """Use the shared package-scoped embedding server.
+    
+    For tests that need specific parameters (like API key), we'll create
+    a temporary server with those parameters. Otherwise, we reuse the
+    shared server to avoid OOM errors.
+    """
     passed_params = []
     if hasattr(request, "param"):
         passed_params = request.param
     if isinstance(passed_params, str):
         passed_params = [passed_params]
-
-    args = [
-        "--runner",
-        "pooling",
-        # use half precision for speed and memory savings in CI environment
-        "--dtype",
-        "float16",
-        "--max-model-len",
-        "512",
-        "--enforce-eager",
-        "--max-num-seqs",
-        "2",
-        *passed_params
-    ]
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
-        yield remote_server
+    
+    # If we need custom parameters, create a temporary server
+    if passed_params:
+        # Create custom server with additional parameters
+        args = [
+            "--runner", "pooling",
+            "--dtype", "bfloat16",  # Use bfloat16 for consistency
+            "--enforce-eager",
+            "--max-model-len", "512",
+            "--max-num-seqs", "4",
+            "--gpu-memory-utilization", "0.7",
+            "--disable-log-stats",
+            "--disable-log-requests",
+            *passed_params
+        ]
+        with RemoteOpenAIServer(MODEL_NAME, args) as custom_server:
+            yield custom_server
+    else:
+        # Use the shared package-scoped server
+        yield embedding_server
 
 
 @pytest.mark.asyncio

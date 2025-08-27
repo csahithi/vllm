@@ -40,27 +40,34 @@ def dtype(request):
 
 
 @pytest.fixture(scope="module")
-def server(model_info, dtype: str):
-    args = [
-        "--runner",
-        "pooling",
-        # use half precision for speed and memory savings in CI environment
-        "--dtype",
-        dtype,
-        "--enforce-eager",
-        "--max-model-len",
-        "512"
-    ]
+def server(model_info, dtype: str, embedding_server):
+    """Use shared server when possible, create custom server only when necessary.
+    
+    This approach minimizes server creation to prevent OOM errors:
+    - Reuse shared server for intfloat/multilingual-e5-small
+    - Create custom server only for models that need special configuration
+    """
+    if model_info.name == "intfloat/multilingual-e5-small":
+        # Use the shared package-scoped server
+        yield embedding_server
+    else:
+        # Create custom server only for models that need special config
+        args = [
+            "--runner", "pooling",
+            "--dtype", dtype,
+            "--enforce-eager",
+            "--max-model-len", "512"
+        ]
 
-    if model_info.name == "Snowflake/snowflake-arctic-embed-m-v1.5":
-        # Manually enable Matryoshka Embeddings
-        args.extend([
-            "--trust_remote_code", "--hf_overrides",
-            '{"matryoshka_dimensions":[256]}'
-        ])
+        if model_info.name == "Snowflake/snowflake-arctic-embed-m-v1.5":
+            # Manually enable Matryoshka Embeddings
+            args.extend([
+                "--trust_remote_code", "--hf_overrides",
+                '{"matryoshka_dimensions":[256]}'
+            ])
 
-    with RemoteOpenAIServer(model_info.name, args) as remote_server:
-        yield remote_server
+        with RemoteOpenAIServer(model_info.name, args) as remote_server:
+            yield remote_server
 
 
 @pytest.fixture(scope="module")
