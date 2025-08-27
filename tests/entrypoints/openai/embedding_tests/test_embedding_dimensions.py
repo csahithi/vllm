@@ -11,11 +11,11 @@ import pytest
 
 from vllm.entrypoints.openai.protocol import EmbeddingResponse
 
-from ...conftest import HfRunner
-from ...models.language.pooling.embed_utils import (
+from ....conftest import HfRunner
+from ....models.language.pooling.embed_utils import (
     run_embedding_correctness_test)
-from ...models.utils import EmbedModelInfo
-from ...utils import RemoteOpenAIServer
+from ....models.utils import EmbedModelInfo
+from ....utils import RemoteOpenAIServer
 
 MODELS = [
     EmbedModelInfo("intfloat/multilingual-e5-small", is_matryoshka=False),

@@ -16,7 +16,7 @@ import pytest_asyncio
 
 from vllm.entrypoints.openai.protocol import EmbeddingResponse
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 
 def _generate_random_text(word_count: int) -> str:

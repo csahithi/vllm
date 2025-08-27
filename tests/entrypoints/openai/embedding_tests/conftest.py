@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 # Single, flexible embedding server configuration that works for all tests
 # This server can handle multilingual-e5-small, matryoshka models, and middleware tests
@@ -27,6 +27,5 @@ def embedding_server():
     - Has reasonable memory requirements
     - Can handle the test workloads efficiently
     """
-    server = RemoteOpenAIServer("intfloat/multilingual-e5-small", UNIVERSAL_EMBEDDING_ARGS, max_wait_seconds=120)
-    yield server
-    server.__exit__(None, None, None)
+    with RemoteOpenAIServer("intfloat/multilingual-e5-small", UNIVERSAL_EMBEDDING_ARGS, max_wait_seconds=120) as server:
+        yield server

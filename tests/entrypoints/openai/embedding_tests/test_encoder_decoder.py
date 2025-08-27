@@ -5,7 +5,7 @@ import openai
 import pytest
 import pytest_asyncio
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 MODEL_NAME = "facebook/bart-base"
 
