@@ -8,7 +8,7 @@ import pytest
 import pytest_asyncio
 
 # # any model with a chat template should work here
-MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
+MODEL_NAME = "microsoft/DialoGPT-small"  # Compatible model for testing
 
 
 # Use the session-scoped server fixture from conftest directly
