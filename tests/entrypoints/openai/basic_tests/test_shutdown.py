@@ -6,7 +6,7 @@ import pytest
 
 from ...utils import RemoteOpenAIServer
 
-MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
 
 
 @pytest.mark.asyncio

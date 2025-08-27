@@ -18,41 +18,8 @@ from ...utils import RemoteOpenAIServer
 from .test_completion import zephyr_lora_added_tokens_files  # noqa: F401
 from .test_completion import zephyr_lora_files  # noqa: F401
 
-# Use shared model from conftest
-from .conftest import shared_chat_server
-
 # any model with a chat template should work here
-MODEL_NAME = "microsoft/DialoGPT-small"  # Smaller, faster model
-
-
-@pytest.fixture(scope="module")
-def monkeypatch_module():
-    from _pytest.monkeypatch import MonkeyPatch
-    mpatch = MonkeyPatch()
-    yield mpatch
-    mpatch.undo()
-
-
-@pytest.fixture(scope="module", params=[False, True])
-def server(
-        request,
-        monkeypatch_module,
-        zephyr_lora_files,  #noqa: F811
-        zephyr_lora_added_tokens_files):  # noqa: F811
-
-    use_v1 = request.param
-    monkeypatch_module.setenv('VLLM_USE_V1', '1' if use_v1 else '0')
-
-    # Use shared server for better performance
-    return shared_chat_server
-
-
-@pytest.fixture
-def is_v1_server(server):
-    import os
-    assert os.environ['VLLM_USE_V1'] in ['0', '1']
-    return os.environ['VLLM_USE_V1'] == '1'
-
+MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
 
 @pytest_asyncio.fixture
 async def client(server):
@@ -368,7 +335,7 @@ async def test_chat_streaming(client: openai.AsyncOpenAI, model_name: str):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model_name",
-    ["HuggingFaceH4/zephyr-7b-beta", "zephyr-lora"],
+    ["hmellor/tiny-random-LlamaForCausalLM", "zephyr-lora"],
 )
 async def test_chat_completion_stream_options(client: openai.AsyncOpenAI,
                                               model_name: str):

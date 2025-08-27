@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import openai  # use the official client for correctness check
 import pytest
 import pytest_asyncio
-# downloading lora to test lora requests
-from huggingface_hub import snapshot_download
+import requests
 
 from ...utils import RemoteOpenAIServer
 
-# any model with a chat template should work here
-MODEL_NAME = "HuggingFaceH4/zephyr-7b-beta"
-# technically this needs Mistral-7B-v0.1 as base, but we're not testing
-# generation quality here
+# Use tiny model for faster testing
+MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
 LORA_NAME = "typeof/zephyr-7b-beta-lora"
 
 

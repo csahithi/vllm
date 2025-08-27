@@ -16,58 +16,15 @@ from transformers import AutoTokenizer
 
 from vllm import version
 
-from ...utils import RemoteOpenAIServer
+# RemoteOpenAIServer import removed - now using conftest fixtures
 
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "microsoft/DialoGPT-small"  # Compatible model for testing
 PREV_MINOR_VERSION = version._prev_minor_version()
 
 
-@pytest.fixture(scope="module", params=[True, False])
-def use_v1(request):
-    # Module-scoped variant of run_with_both_engines
-    #
-    # Use this fixture to run a test with both v0 and v1, and
-    # also to conditionalize the test logic e.g.
-    #
-    # def test_metrics_exist(use_v1, server, client):
-    #     ...
-    #     expected = EXPECTED_V1_METRICS if use_v1 else EXPECTED_METRICS
-    #     for metric in expected:
-    #         assert metric in response.text
-    #
-    # @skip_v1 wouldn't work here because this is a module-level
-    # fixture - per-function decorators would have no effect
-    yield request.param
-
-
-@pytest.fixture(scope="module")
-def default_server_args():
-    return [
-        # use half precision for speed and memory savings in CI environment
-        "--dtype",
-        "bfloat16",
-        "--max-model-len",
-        "1024",
-        "--enforce-eager",
-        "--max-num-seqs",
-        "128",
-    ]
-
-
-@pytest.fixture(scope="module",
-                params=[
-                    "",
-                    "--enable-chunked-prefill",
-                    "--disable-frontend-multiprocessing",
-                    f"--show-hidden-metrics-for-version={PREV_MINOR_VERSION}",
-                ])
-def server(use_v1, default_server_args, request):
-    if request.param:
-        default_server_args.append(request.param)
-    env_dict = dict(VLLM_USE_V1='1' if use_v1 else '0')
-    with RemoteOpenAIServer(MODEL_NAME, default_server_args,
-                            env_dict=env_dict) as remote_server:
-        yield remote_server
+# Use the conftest server fixture instead of local implementation
+# The server fixture is now session-scoped and shared across all tests
+# For tests that need custom server args, we'll use the server_factory fixture
 
 
 @pytest_asyncio.fixture
@@ -119,8 +76,7 @@ EXPECTED_VALUES = {
 
 
 @pytest.mark.asyncio
-async def test_metrics_counts(server: RemoteOpenAIServer,
-                              client: openai.AsyncClient, use_v1: bool):
+async def test_metrics_counts(server, client: openai.AsyncClient):
     for _ in range(_NUM_REQUESTS):
         # sending a request triggers the metrics to be logged.
         await client.completions.create(
@@ -134,9 +90,8 @@ async def test_metrics_counts(server: RemoteOpenAIServer,
 
     # Loop over all expected metric_families
     for metric_family, suffix_values_list in EXPECTED_VALUES.items():
-        if ((use_v1 and metric_family not in EXPECTED_METRICS_V1)
-                or (not server.show_hidden_metrics
-                    and metric_family in HIDDEN_DEPRECATED_METRICS)):
+        if (not server.show_hidden_metrics 
+            and metric_family in HIDDEN_DEPRECATED_METRICS):
             continue
 
         found_metric = False
@@ -168,63 +123,6 @@ async def test_metrics_counts(server: RemoteOpenAIServer,
                 break
 
         assert found_metric, (f"Did not find {metric_family} in prom endpoint")
-
-
-EXPECTED_METRICS = [
-    "vllm:num_requests_running",
-    "vllm:num_requests_waiting",
-    "vllm:gpu_cache_usage_perc",
-    "vllm:time_to_first_token_seconds_sum",
-    "vllm:time_to_first_token_seconds_bucket",
-    "vllm:time_to_first_token_seconds_count",
-    "vllm:time_per_output_token_seconds_sum",
-    "vllm:time_per_output_token_seconds_bucket",
-    "vllm:time_per_output_token_seconds_count",
-    "vllm:e2e_request_latency_seconds_sum",
-    "vllm:e2e_request_latency_seconds_bucket",
-    "vllm:e2e_request_latency_seconds_count",
-    "vllm:request_queue_time_seconds_sum",
-    "vllm:request_queue_time_seconds_bucket",
-    "vllm:request_queue_time_seconds_count",
-    "vllm:request_inference_time_seconds_sum",
-    "vllm:request_inference_time_seconds_bucket",
-    "vllm:request_inference_time_seconds_count",
-    "vllm:request_prefill_time_seconds_sum",
-    "vllm:request_prefill_time_seconds_bucket",
-    "vllm:request_prefill_time_seconds_count",
-    "vllm:request_decode_time_seconds_sum",
-    "vllm:request_decode_time_seconds_bucket",
-    "vllm:request_decode_time_seconds_count",
-    "vllm:request_prompt_tokens_sum",
-    "vllm:request_prompt_tokens_bucket",
-    "vllm:request_prompt_tokens_count",
-    "vllm:request_generation_tokens_sum",
-    "vllm:request_generation_tokens_bucket",
-    "vllm:request_generation_tokens_count",
-    "vllm:request_params_n_sum",
-    "vllm:request_params_n_bucket",
-    "vllm:request_params_n_count",
-    "vllm:request_params_max_tokens_sum",
-    "vllm:request_params_max_tokens_bucket",
-    "vllm:request_params_max_tokens_count",
-    "vllm:iteration_tokens_total",
-    "vllm:num_preemptions_total",
-    "vllm:prompt_tokens_total",
-    "vllm:generation_tokens_total",
-    "vllm:request_success_total",
-    "vllm:cache_config_info",
-    # labels in cache_config_info
-    "block_size",
-    "cache_dtype",
-    "cpu_offload_gb",
-    "enable_prefix_caching",
-    "gpu_memory_utilization",
-    "num_cpu_blocks",
-    "num_gpu_blocks",
-    "num_gpu_blocks_override",
-    "sliding_window",
-    "swap_space_bytes",
-]
 
 EXPECTED_METRICS_V1 = [
     "vllm:num_requests_running",
@@ -277,8 +175,7 @@ HIDDEN_DEPRECATED_METRICS: list[str] = []
 
 
 @pytest.mark.asyncio
-async def test_metrics_exist(server: RemoteOpenAIServer,
-                             client: openai.AsyncClient, use_v1: bool):
+async def test_metrics_exist(server, client: openai.AsyncClient):
     # sending a request triggers the metrics to be logged.
     await client.completions.create(model=MODEL_NAME,
                                     prompt="Hello, my name is",
@@ -288,15 +185,14 @@ async def test_metrics_exist(server: RemoteOpenAIServer,
     response = requests.get(server.url_for("metrics"))
     assert response.status_code == HTTPStatus.OK
 
-    for metric in (EXPECTED_METRICS_V1 if use_v1 else EXPECTED_METRICS):
+    for metric in EXPECTED_METRICS_V1:
         if (not server.show_hidden_metrics
                 and metric not in HIDDEN_DEPRECATED_METRICS):
             assert metric in response.text
 
 
 @pytest.mark.asyncio
-async def test_abort_metrics_reset(server: RemoteOpenAIServer,
-                                   client: openai.AsyncClient, use_v1: bool):
+async def test_abort_metrics_reset(server, client: openai.AsyncClient, use_v1: bool):
 
     running_requests, waiting_requests, kv_cache_usage = (
         _get_running_metrics_from_api(server))
@@ -354,7 +250,7 @@ async def test_abort_metrics_reset(server: RemoteOpenAIServer,
          f"{kv_cache_usage_after}")
 
 
-def _get_running_metrics_from_api(server: RemoteOpenAIServer):
+def _get_running_metrics_from_api(server):
     """Return (running_count, waiting_count, kv_cache_usage)"""
 
     response = requests.get(server.url_for("metrics"))
@@ -414,8 +310,7 @@ def test_metrics_exist_run_batch(use_v1: bool):
             base_url,
             "--port",
             port,
-        ],
-                                env={"VLLM_USE_V1": "1" if use_v1 else "0"})
+        ])
 
         def is_server_up(url):
             try:

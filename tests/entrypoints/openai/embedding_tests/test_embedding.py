@@ -19,8 +19,8 @@ from ...models.language.pooling.embed_utils import (
 from ...models.utils import check_embeddings_close
 from ...utils import RemoteOpenAIServer
 
-# Use shared fixtures from conftest
-from .conftest import shared_embedding_server
+# Use session-scoped embedding_server fixture from conftest
+# No need to import - it's automatically available
 
 MODEL_NAME = "intfloat/multilingual-e5-small"
 DUMMY_CHAT_TEMPLATE = """{% for message in messages %}{{message['role'] + ': ' + message['content'] + '\\n'}}{% endfor %}"""  # noqa: E501
@@ -36,9 +36,9 @@ def v1(run_with_both_engines):
 
 
 @pytest.fixture(scope="module")
-def server():
-    # Use shared server for better performance
-    return shared_embedding_server
+def server(embedding_server):
+    # Use session-scoped embedding_server for better performance
+    return embedding_server
 
 
 @pytest_asyncio.fixture

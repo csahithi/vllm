@@ -5,22 +5,26 @@ import openai  # use the official client for correctness check
 import pytest
 import pytest_asyncio
 
-from ...utils import RemoteOpenAIServer
+from .conftest import server_factory
 
 # a reasoning and tool calling model
 MODEL_NAME = "Qwen/QwQ-32B"
 
 
 @pytest.fixture(scope="module")
-def server():  # noqa: F811
-    args = [
-        "--max-model-len", "8192", "--enforce-eager", "--reasoning-parser",
-        "deepseek_r1", "--enable-auto-tool-choice", "--tool-call-parser",
-        "hermes"
+def server(server_factory):  # noqa: F811
+    # Use server_factory with custom args for tool reasoning
+    custom_args = [
+        "--max-model-len", "8192", 
+        "--enforce-eager", 
+        "--reasoning-parser", "deepseek_r1", 
+        "--enable-auto-tool-choice", 
+        "--tool-call-parser", "hermes",
+        "--disable-log-stats",
+        "--disable-log-requests"
     ]
-
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
-        yield remote_server
+    
+    return server_factory(MODEL_NAME, server_args=custom_args)
 
 
 @pytest_asyncio.fixture

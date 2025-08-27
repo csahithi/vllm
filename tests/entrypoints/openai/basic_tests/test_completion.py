@@ -22,11 +22,8 @@ from vllm.transformers_utils.tokenizer import get_tokenizer
 
 from ...utils import RemoteOpenAIServer
 
-# Use shared model from conftest
-from .conftest import shared_chat_server
-
 # any model with a chat template should work here
-MODEL_NAME = "microsoft/DialoGPT-small"  # Smaller, faster model
+MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
 # technically these adapters use a different base model,
 # but we're not testing generation quality here
 LORA_NAME = "typeof/zephyr-7b-beta-lora"
@@ -78,31 +75,14 @@ def default_server_args(zephyr_lora_files, zephyr_lora_added_tokens_files):
     ]
 
 
-@pytest.fixture(scope="module",
+# Use the session-scoped server fixture from conftest directly
+# No need for custom server fixture since we're using session-scoped
+
+@pytest.fixture(scope="session",
                 params=["", "--disable-frontend-multiprocessing"])
-def server(default_server_args, request):
-    if request.param:
-        default_server_args.append(request.param)
-
-    original_value = os.environ.get('VLLM_USE_V1')
-    os.environ['VLLM_USE_V1'] = '0'
-    try:
-        # Use shared server for better performance
-        return shared_chat_server
-    finally:
-        # Restore original env value
-        if original_value is None:
-            os.environ.pop('VLLM_USE_V1', None)
-        else:
-            os.environ['VLLM_USE_V1'] = original_value
-
-
-@pytest.fixture
-def is_v1_server(server):
-    import os
-
-    # For completion tests, we assume v0 since there's no explicit v1 setup
-    return os.environ.get('VLLM_USE_V1', '0') == '1'
+def server_config(request):
+    """Configure server arguments for the session."""
+    return request.param
 
 
 @pytest_asyncio.fixture

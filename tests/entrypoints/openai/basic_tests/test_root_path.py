@@ -8,32 +8,19 @@ from typing import Any, NamedTuple
 import openai  # use the official client for correctness check
 import pytest
 
-from ...utils import RemoteOpenAIServer
+# RemoteOpenAIServer import removed - now using conftest fixtures
 
 # # any model with a chat template should work here
-MODEL_NAME = "Qwen/Qwen2-1.5B-Instruct"
+MODEL_NAME = "microsoft/DialoGPT-small"  # Compatible model for testing
 API_KEY = "abc-123"
 ERROR_API_KEY = "abc"
 ROOT_PATH = "llm"
 
 
-@pytest.fixture(scope="module")
-def server():
-    args = [
-        # use half precision for speed and memory savings in CI environment
-        "--dtype",
-        "float16",
-        "--enforce-eager",
-        "--max-model-len",
-        "4080",
-        "--root-path",  # use --root-path=/llm for testing
-        "/" + ROOT_PATH,
-    ]
-    envs = os.environ.copy()
-
-    envs["VLLM_API_KEY"] = API_KEY
-    with RemoteOpenAIServer(MODEL_NAME, args, env_dict=envs) as remote_server:
-        yield remote_server
+# Use the conftest server fixture instead of local implementation
+# The server fixture is now session-scoped and shared across all tests
+# Note: This test requires custom server args for root-path testing
+# We'll use the server_factory fixture for this specific case
 
 
 class TestCase(NamedTuple):
@@ -69,17 +56,27 @@ class TestCase(NamedTuple):
             expected_error=None),
     ],
 )
-async def test_chat_session_root_path_with_api_key(server: RemoteOpenAIServer,
-                                                   test_case: TestCase):
+async def test_chat_session_root_path_with_api_key(server_factory, test_case: TestCase):
     saying: str = "Here is a common saying about apple. An apple a day, keeps"
     ctx = contextlib.nullcontext()
     if test_case.expected_error is not None:
         ctx = pytest.raises(test_case.expected_error)
     with ctx:
-        client = openai.AsyncOpenAI(
-            api_key=test_case.api_key,
-            base_url=server.url_for(*test_case.base_url),
-            max_retries=0)
+        # Create server with custom root-path configuration
+        custom_args = [
+            "--dtype", "float16",
+            "--enforce-eager",
+            "--max-model-len", "4080",
+            "--root-path", "/" + ROOT_PATH,
+        ]
+        custom_envs = {"VLLM_API_KEY": API_KEY}
+        
+        # Use server_factory to create server with custom args
+        with server_factory(MODEL_NAME, custom_args, env_dict=custom_envs) as custom_server:
+            client = openai.AsyncOpenAI(
+                api_key=test_case.api_key,
+                base_url=custom_server.url_for(*test_case.base_url),
+                max_retries=0)
         chat_completion = await client.chat.completions.create(
             model=test_case.model_name,
             messages=[{
