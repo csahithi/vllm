@@ -47,21 +47,18 @@ VIDEO_SERVER_ARGS = [
 
 @pytest.fixture(scope="package")
 def vision_server():
-    """Package-scoped vision server."""
-    server = RemoteOpenAIServer("microsoft/Phi-3.5-vision-instruct", VISION_SERVER_ARGS, max_wait_seconds=120)
-    yield server
-    server.__exit__(None, None, None)
+    """Package-scoped vision server for all vision tests."""
+    with RemoteOpenAIServer("microsoft/Phi-3.5-vision-instruct", VISION_SERVER_ARGS, max_wait_seconds=120) as server:
+        yield server
 
 @pytest.fixture(scope="package")
 def audio_server():
-    """Package-scoped audio server."""
-    server = RemoteOpenAIServer("fixie-ai/ultravox-v0_5-llama-3_2-1b", AUDIO_SERVER_ARGS, max_wait_seconds=120)
-    yield server
-    server.__exit__(None, None, None)
+    """Package-scoped audio server for all audio tests."""
+    with RemoteOpenAIServer("fixie-ai/ultravox-v0_5-llama-3_2-1b", AUDIO_SERVER_ARGS, max_wait_seconds=120) as server:
+        yield server
 
 @pytest.fixture(scope="package")
 def video_server():
-    """Package-scoped video server."""
-    server = RemoteOpenAIServer("microsoft/Phi-3.5-vision-instruct", VIDEO_SERVER_ARGS, max_wait_seconds=120)
-    yield server
-    server.__exit__(None, None, None)
+    """Package-scoped video server for all video tests."""
+    with RemoteOpenAIServer("microsoft/Phi-3.5-vision-instruct", VIDEO_SERVER_ARGS, max_wait_seconds=120) as server:
+        yield server
