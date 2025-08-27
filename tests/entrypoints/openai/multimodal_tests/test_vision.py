@@ -12,7 +12,7 @@ from transformers import AutoProcessor
 
 from vllm.multimodal.utils import encode_image_base64, fetch_image
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 MODEL_NAME = "microsoft/Phi-3.5-vision-instruct"
 MAXIMUM_IMAGES = 2

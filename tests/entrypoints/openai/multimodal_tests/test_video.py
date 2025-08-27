@@ -9,7 +9,7 @@ import pytest_asyncio
 
 from vllm.multimodal.utils import encode_video_base64, fetch_video
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 MODEL_NAME = "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"
 MAXIMUM_VIDEOS = 4

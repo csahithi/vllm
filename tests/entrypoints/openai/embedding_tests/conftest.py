@@ -6,6 +6,7 @@ from ....utils import RemoteOpenAIServer
 
 # Single, flexible embedding server configuration that works for all tests
 # This server can handle multilingual-e5-small, matryoshka models, and middleware tests
+DUMMY_CHAT_TEMPLATE = """{% for message in messages %}{{message['role'] + ': ' + message['content'] + '\\n'}}{% endfor %}"""  # noqa: E501
 UNIVERSAL_EMBEDDING_ARGS = [
     "--runner", "pooling",
     "--dtype", "bfloat16",  # Use bfloat16 for better compatibility
@@ -14,7 +15,9 @@ UNIVERSAL_EMBEDDING_ARGS = [
     "--gpu-memory-utilization", "0.7",
     "--max-num-seqs", "4",  # Increased to handle multiple test scenarios
     "--disable-log-stats",
-    "--disable-log-requests"
+    "--disable-log-requests",
+    "--chat-template",
+    DUMMY_CHAT_TEMPLATE
 ]
 
 @pytest.fixture(scope="package")

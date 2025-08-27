@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 # Vision server configuration
 VISION_SERVER_ARGS = [
