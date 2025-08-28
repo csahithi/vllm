@@ -21,7 +21,6 @@ from transformers import AutoTokenizer
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
 from ....utils import RemoteOpenAIServer
-from .conftest import server as shared_server  # Import the shared server
 
 # any model with a chat template should work here
 MODEL_NAME = "microsoft/DialoGPT-small"  # Compatible model for testing
@@ -54,12 +53,15 @@ def zephyr_lora_added_tokens_files(zephyr_lora_files):
 
 
 @pytest.fixture(scope="module")
-def lora_server(zephyr_lora_files, zephyr_lora_added_tokens_files):
-    """Custom server for LoRA model tests."""
-    args = [
-        "--dtype", "bfloat16",
-        "--max-model-len", "8192",
-        "--max-num-seqs", "128",
+def default_server_args(zephyr_lora_files, zephyr_lora_added_tokens_files):
+    return [
+        # use half precision for speed and memory savings in CI environment
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "8192",
+        "--max-num-seqs",
+        "128",
         "--enforce-eager",
         "--enable-lora",
         "--lora-modules",
@@ -70,27 +72,17 @@ def lora_server(zephyr_lora_files, zephyr_lora_added_tokens_files):
         "--max-cpu-loras",
         "2",
     ]
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
-        yield remote_server
 
 
-@pytest.fixture
-def server(request):
-    """Smart server selection: use shared server for base model, custom server for LoRA.
-    
-    This fixture intelligently selects between:
-    - shared_server: For base model tests (MODEL_NAME)
-    - lora_server: For LoRA model tests (zephyr-lora, zephyr-lora2)
-    
-    This maximizes server reuse while maintaining specialized LoRA functionality.
-    """
-    model_name = request.getfixturevalue("model_name")
-    if model_name == MODEL_NAME:
-        # Use shared server for base model tests
-        return shared_server
-    else:
-        # Use custom server for LoRA model tests
-        return request.getfixturevalue("lora_server")
+@pytest.fixture(scope="module",
+                params=["", "--disable-frontend-multiprocessing"])
+def server(default_server_args, request):
+    if request.param:
+        default_server_args.append(request.param)
+
+    with RemoteOpenAIServer(MODEL_NAME,
+         default_server_args) as remote_server:
+         yield remote_server
 
 
 @pytest.fixture(scope="session",
