@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+from vllm import version
 from ....utils import RemoteOpenAIServer
 
 # Basic tests use a simple, lightweight server configuration
