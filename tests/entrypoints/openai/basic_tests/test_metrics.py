@@ -88,8 +88,7 @@ async def test_metrics_counts(client: openai.AsyncClient):
     # Loop over all expected metric_families
     for metric_family, suffix_values_list in EXPECTED_VALUES.items():
         if (metric_family not in EXPECTED_METRICS_V1
-                or (not server.show_hidden_metrics
-                    and metric_family in HIDDEN_DEPRECATED_METRICS)):
+                or metric_family in HIDDEN_DEPRECATED_METRICS):
             continue
 
         found_metric = False
@@ -184,8 +183,7 @@ async def test_metrics_exist(client: openai.AsyncClient):
     assert response.status_code == HTTPStatus.OK
 
     for metric in EXPECTED_METRICS_V1:
-        if (not server.show_hidden_metrics
-                and metric not in HIDDEN_DEPRECATED_METRICS):
+        if metric not in HIDDEN_DEPRECATED_METRICS:
             assert metric in response.text
 
 
