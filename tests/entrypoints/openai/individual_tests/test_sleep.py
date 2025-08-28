@@ -5,7 +5,7 @@ import requests
 
 from ....utils import RemoteOpenAIServer
 
-MODEL_NAME = "microsoft/DialoGPT-small"
+MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
 
 
 def test_sleep_mode():

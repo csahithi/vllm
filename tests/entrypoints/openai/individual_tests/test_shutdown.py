@@ -6,7 +6,7 @@ import pytest
 
 from ....utils import RemoteOpenAIServer
 
-MODEL_NAME = "microsoft/DialoGPT-small"
+MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 
 
 @pytest.mark.asyncio
