@@ -16,19 +16,16 @@ from transformers import AutoTokenizer
 
 from vllm import version
 
-# RemoteOpenAIServer import removed - now using conftest fixtures
+from ....utils import RemoteOpenAIServer
+
+from .conftest import server
 
 MODEL_NAME = "microsoft/DialoGPT-small"  # Compatible model for testing
 PREV_MINOR_VERSION = version._prev_minor_version()
 
 
-# Use the conftest server fixture instead of local implementation
-# The server fixture is now session-scoped and shared across all tests
-# For tests that need custom server args, we'll use the server_factory fixture
-
-
 @pytest_asyncio.fixture
-async def client(server):
+async def client():
     async with server.get_async_client() as cl:
         yield cl
 
@@ -76,7 +73,8 @@ EXPECTED_VALUES = {
 
 
 @pytest.mark.asyncio
-async def test_metrics_counts(server, client: openai.AsyncClient):
+async def test_metrics_counts(server: RemoteOpenAIServer,
+                              client: openai.AsyncClient):
     for _ in range(_NUM_REQUESTS):
         # sending a request triggers the metrics to be logged.
         await client.completions.create(
@@ -90,8 +88,9 @@ async def test_metrics_counts(server, client: openai.AsyncClient):
 
     # Loop over all expected metric_families
     for metric_family, suffix_values_list in EXPECTED_VALUES.items():
-        if (not server.show_hidden_metrics 
-            and metric_family in HIDDEN_DEPRECATED_METRICS):
+        if (metric_family not in EXPECTED_METRICS_V1
+                or (not server.show_hidden_metrics
+                    and metric_family in HIDDEN_DEPRECATED_METRICS)):
             continue
 
         found_metric = False
@@ -175,7 +174,8 @@ HIDDEN_DEPRECATED_METRICS: list[str] = []
 
 
 @pytest.mark.asyncio
-async def test_metrics_exist(server, client: openai.AsyncClient):
+async def test_metrics_exist(server: RemoteOpenAIServer,
+                             client: openai.AsyncClient):
     # sending a request triggers the metrics to be logged.
     await client.completions.create(model=MODEL_NAME,
                                     prompt="Hello, my name is",
@@ -192,7 +192,8 @@ async def test_metrics_exist(server, client: openai.AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_abort_metrics_reset(server, client: openai.AsyncClient, use_v1: bool):
+async def test_abort_metrics_reset(server: RemoteOpenAIServer,
+                                   client: openai.AsyncClient):
 
     running_requests, waiting_requests, kv_cache_usage = (
         _get_running_metrics_from_api(server))
@@ -250,7 +251,7 @@ async def test_abort_metrics_reset(server, client: openai.AsyncClient, use_v1: b
          f"{kv_cache_usage_after}")
 
 
-def _get_running_metrics_from_api(server):
+def _get_running_metrics_from_api(server: RemoteOpenAIServer):
     """Return (running_count, waiting_count, kv_cache_usage)"""
 
     response = requests.get(server.url_for("metrics"))
@@ -283,7 +284,7 @@ def _get_running_metrics_from_api(server):
     return running_requests, waiting_requests, kv_cache_usage
 
 
-def test_metrics_exist_run_batch(use_v1: bool):
+def test_metrics_exist_run_batch():
     input_batch = """{"custom_id": "request-0", "method": "POST", "url": "/v1/embeddings", "body": {"model": "intfloat/multilingual-e5-small", "input": "You are a helpful assistant."}}"""  # noqa: E501
 
     base_url = "0.0.0.0"
