@@ -25,7 +25,8 @@ PREV_MINOR_VERSION = version._prev_minor_version()
 
 
 @pytest_asyncio.fixture
-async def client():
+async def client(server):
+    """Client fixture using the shared server from conftest."""
     async with server.get_async_client() as cl:
         yield cl
 
@@ -73,7 +74,7 @@ EXPECTED_VALUES = {
 
 
 @pytest.mark.asyncio
-async def test_metrics_counts(client: openai.AsyncClient):
+async def test_metrics_counts(client: openai.AsyncClient, server):
     for _ in range(_NUM_REQUESTS):
         # sending a request triggers the metrics to be logged.
         await client.completions.create(
@@ -172,7 +173,7 @@ HIDDEN_DEPRECATED_METRICS: list[str] = []
 
 
 @pytest.mark.asyncio
-async def test_metrics_exist(client: openai.AsyncClient):
+async def test_metrics_exist(client: openai.AsyncClient, server):
     # sending a request triggers the metrics to be logged.
     await client.completions.create(model=MODEL_NAME,
                                     prompt="Hello, my name is",
@@ -188,10 +189,10 @@ async def test_metrics_exist(client: openai.AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_abort_metrics_reset(client: openai.AsyncClient):
+async def test_abort_metrics_reset(client: openai.AsyncClient, server):
 
     running_requests, waiting_requests, kv_cache_usage = (
-        _get_running_metrics_from_api())
+        _get_running_metrics_from_api(server))
 
     # Expect no running requests or kvcache usage
     assert running_requests == 0
@@ -214,7 +215,7 @@ async def test_abort_metrics_reset(client: openai.AsyncClient):
 
     # Check that we have running requests
     running_requests, waiting_requests, kv_cache_usage = (
-        _get_running_metrics_from_api())
+        _get_running_metrics_from_api(server))
 
     # Expect running requests and kvcache usage
     assert running_requests > 0
@@ -233,7 +234,7 @@ async def test_abort_metrics_reset(client: openai.AsyncClient):
 
     # Verify running and waiting requests counts and KV cache usage are zero
     running_requests_after, waiting_requests_after, kv_cache_usage_after = (
-        _get_running_metrics_from_api())
+        _get_running_metrics_from_api(server))
 
     assert running_requests_after == 0,\
         (f"Expected 0 running requests after abort, got "
@@ -246,7 +247,7 @@ async def test_abort_metrics_reset(client: openai.AsyncClient):
          f"{kv_cache_usage_after}")
 
 
-def _get_running_metrics_from_api():
+def _get_running_metrics_from_api(server):
     """Return (running_count, waiting_count, kv_cache_usage)"""
 
     response = requests.get(server.url_for("metrics"))
