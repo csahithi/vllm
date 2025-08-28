@@ -5,7 +5,7 @@ import openai  # use the official client for correctness check
 import pytest
 import pytest_asyncio
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 # any model with a chat template should work here
 MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"  # Tiny model for fast testing
@@ -23,7 +23,6 @@ def server():
         # lora config below
         "--max-num-seqs",
         "128",
-        "--enable-chunked-prefill",
         "--max-num-batched-tokens",
         "1000",
     ]

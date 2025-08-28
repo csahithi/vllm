@@ -10,7 +10,7 @@ from vllm.entrypoints.openai.cli_args import (make_arg_parser,
 from vllm.entrypoints.openai.serving_models import LoRAModulePath
 from vllm.utils import FlexibleArgumentParser
 
-from ...utils import VLLM_PATH
+from ....utils import VLLM_PATH
 
 LORA_MODULE = {
     "name": "module2",

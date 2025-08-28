@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from vllm.entrypoints.openai.protocol import ClassificationResponse
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 MODEL_NAME = "jason9693/Qwen2.5-1.5B-apeach"
 DTYPE = "float32"  # Use float32 to avoid NaN issue

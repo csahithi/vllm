@@ -8,7 +8,7 @@ import pytest
 import pytest_asyncio
 
 # downloading lora to test lora requests
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 # any model with a chat template should work here
 MODEL_NAME = "Qwen/Qwen3-0.6B"
