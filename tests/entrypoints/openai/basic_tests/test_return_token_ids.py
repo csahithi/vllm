@@ -5,25 +5,7 @@ import pytest
 
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-from ...utils import RemoteOpenAIServer
-
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-
-
-@pytest.fixture(scope="module")
-def server():
-    args = [
-        "--max-model-len",
-        "2048",
-        "--max-num-seqs",
-        "128",
-        "--enable-auto-tool-choice",
-        "--tool-call-parser",
-        "hermes",
-        "--enforce-eager",
-    ]
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
-        yield remote_server
+MODEL_NAME = "microsoft/DialoGPT-small"
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ from tests.models.utils import check_embeddings_close
 from vllm.entrypoints.openai.protocol import PoolingResponse
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 MODEL_NAME = "internlm/internlm2-1_8b-reward"
 DUMMY_CHAT_TEMPLATE = """{% for message in messages %}{{message['role'] + ': ' + message['content'] + '\\n'}}{% endfor %}"""  # noqa: E501

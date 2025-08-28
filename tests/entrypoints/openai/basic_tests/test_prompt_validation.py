@@ -12,13 +12,7 @@ import torch
 
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 
-from ...utils import RemoteOpenAIServer
-
-
-@pytest.fixture(scope="function", autouse=True)
-def use_v1_only(monkeypatch):
-    monkeypatch.setenv('VLLM_USE_V1', '1')
-
+from ....utils import RemoteOpenAIServer
 
 @pytest.mark.asyncio
 async def test_empty_prompt():

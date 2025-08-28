@@ -9,7 +9,7 @@ import pytest_asyncio
 import requests
 from openai import BadRequestError, NotFoundError, OpenAI
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 pytest.skip(allow_module_level=True, reason="gpt-oss can't run on CI yet.")
 

@@ -8,18 +8,10 @@ import torch.nn.functional as F
 
 from vllm.entrypoints.openai.protocol import RerankResponse
 
-from ...utils import RemoteOpenAIServer
+from ....utils import RemoteOpenAIServer
 
 MODEL_NAME = "BAAI/bge-reranker-base"
 DTYPE = "bfloat16"
-
-
-@pytest.fixture(autouse=True)
-def v1(run_with_both_engines):
-    # Simple autouse wrapper to run both engines for each test
-    # This can be promoted up to conftest.py to run for every
-    # test in a package
-    pass
 
 
 @pytest.fixture(scope="module")
