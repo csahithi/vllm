@@ -235,7 +235,7 @@ async def test_abort_metrics_reset(server: RemoteOpenAIServer,
                                    client: openai.AsyncClient):
 
     running_requests, waiting_requests, kv_cache_usage = (
-        _get_running_metrics_from_api(server, use_v1))
+        _get_running_metrics_from_api(server))
 
     # Expect no running requests or kvcache usage
     assert running_requests == 0
@@ -258,7 +258,7 @@ async def test_abort_metrics_reset(server: RemoteOpenAIServer,
 
     # Check that we have running requests
     running_requests, waiting_requests, kv_cache_usage = (
-        _get_running_metrics_from_api(server, use_v1))
+        _get_running_metrics_from_api(server))
 
     # Expect running requests and kvcache usage
     assert running_requests > 0
@@ -277,7 +277,7 @@ async def test_abort_metrics_reset(server: RemoteOpenAIServer,
 
     # Verify running and waiting requests counts and KV cache usage are zero
     running_requests_after, waiting_requests_after, kv_cache_usage_after = (
-        _get_running_metrics_from_api(server, use_v1))
+        _get_running_metrics_from_api(server))
 
     assert running_requests_after == 0,\
         (f"Expected 0 running requests after abort, got "
@@ -290,7 +290,7 @@ async def test_abort_metrics_reset(server: RemoteOpenAIServer,
          f"{kv_cache_usage_after}")
 
 
-def _get_running_metrics_from_api(server: RemoteOpenAIServer, use_v1: bool):
+def _get_running_metrics_from_api(server: RemoteOpenAIServer):
     """Return (running_count, waiting_count, kv_cache_usage)"""
 
     response = requests.get(server.url_for("metrics"))
@@ -299,8 +299,7 @@ def _get_running_metrics_from_api(server: RemoteOpenAIServer, use_v1: bool):
     # Verify running and waiting requests counts and KV cache usage are zero
     running_requests, waiting_requests, kv_cache_usage = None, None, None
 
-    kv_cache_usage_metric = ("vllm:kv_cache_usage_perc"
-                             if use_v1 else "vllm:gpu_cache_usage_perc")
+    kv_cache_usage_metric = ("vllm:kv_cache_usage_perc")
 
     for family in text_string_to_metric_families(response.text):
         if family.name == "vllm:num_requests_running":
