@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+from collections.abc import Callable
 from datetime import datetime, timezone
 import enum
 import faulthandler
@@ -13,6 +14,7 @@ import threading
 import time
 import traceback as traceback_utils
 from types import TracebackType
+from typing import Any
 
 import torch
 from typing_extensions import Self
@@ -74,6 +76,7 @@ def dump_engine_exception(
     scheduler_output: SchedulerOutput,
     scheduler_stats: SchedulerStats | None,
     error: Exception | None = None,
+    scheduler_snapshot: dict[str, Any] | None = None,
 ):
     # NOTE: ensure we can log extra info without risking raises
     # unexpected errors during logging
@@ -84,6 +87,7 @@ def dump_engine_exception(
             scheduler_output,
             scheduler_stats,
             error=error,
+            scheduler_snapshot=scheduler_snapshot,
         )
 
 
@@ -93,6 +97,7 @@ def dump_engine_execution_timeout(
     scheduler_stats: SchedulerStats | None,
     timeout_s: float,
     stage: str,
+    scheduler_snapshot: dict[str, Any] | None = None,
 ):
     if not _mark_engine_execution_timeout_dump(stage):
         return
@@ -116,6 +121,7 @@ def dump_engine_execution_timeout(
             scheduler_stats,
             stage=stage,
             timeout_s=timeout_s,
+            scheduler_snapshot=scheduler_snapshot,
         )
 
     if diagnostic_bundle_dir is not None:
@@ -146,6 +152,7 @@ def _dump_engine_execution_context(
     stage: str | None = None,
     timeout_s: float | None = None,
     error: Exception | None = None,
+    scheduler_snapshot: dict[str, Any] | None = None,
 ) -> Path | None:
     logger.error(
         "Dumping input data for V1 LLM engine (v%s, reason=%s) with config: %s, ",
@@ -164,6 +171,15 @@ def _dump_engine_execution_context(
         if scheduler_stats:
             scheduler_stats_dump = str(scheduler_stats)
             logger.error("Dumping scheduler stats: %s", scheduler_stats_dump)
+        if scheduler_snapshot is not None:
+            logger.error(
+                "Dumping scheduler diagnostic snapshot: %s",
+                json.dumps(
+                    scheduler_snapshot,
+                    default=prepare_object_to_dump,
+                    sort_keys=True,
+                ),
+            )
     except Exception:
         logger.exception("Error preparing object to dump")
 
@@ -175,6 +191,7 @@ def _dump_engine_execution_context(
         stage=stage,
         timeout_s=timeout_s,
         error=error,
+        scheduler_snapshot=scheduler_snapshot,
     )
 
 
@@ -187,6 +204,7 @@ def _write_engine_diagnostic_bundle(
     stage: str | None,
     timeout_s: float | None,
     error: Exception | None,
+    scheduler_snapshot: dict[str, Any] | None,
 ) -> Path | None:
     try:
         dump_root = _engine_diagnostic_dump_root(config)
@@ -196,6 +214,14 @@ def _write_engine_diagnostic_bundle(
         bundle_dir, created_at = _create_engine_diagnostic_bundle_dir(
             dump_root, reason, stage
         )
+        scheduler_snapshot_file: str | None = None
+        if scheduler_snapshot is not None:
+            scheduler_snapshot_file = "scheduler_snapshot.json"
+            _write_engine_diagnostic_json(
+                bundle_dir / scheduler_snapshot_file,
+                scheduler_snapshot,
+            )
+
         context = {
             "bundle_version": ENGINE_DIAGNOSTIC_BUNDLE_VERSION,
             "config": str(config),
@@ -203,16 +229,14 @@ def _write_engine_diagnostic_bundle(
             "exception": _format_engine_diagnostic_exception(error),
             "pid": os.getpid(),
             "reason": reason,
+            "scheduler_snapshot_file": scheduler_snapshot_file,
             "scheduler_output": scheduler_output_dump,
             "scheduler_stats": scheduler_stats_dump,
             "stage": stage,
             "timeout_s": timeout_s,
             "vllm_version": VLLM_VERSION,
         }
-        (bundle_dir / "context.json").write_text(
-            json.dumps(context, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        _write_engine_diagnostic_json(bundle_dir / "context.json", context)
         logger.error("Wrote V1 LLM engine diagnostic bundle to %s", bundle_dir)
         return bundle_dir
     except Exception:
@@ -228,6 +252,18 @@ def _engine_diagnostic_dump_root(config: VllmConfig) -> Path | None:
     if debug_dump_path is None:
         return None
     return debug_dump_path / ENGINE_DIAGNOSTIC_DUMP_DIR
+
+
+def _write_engine_diagnostic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(
+            payload,
+            default=prepare_object_to_dump,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _create_engine_diagnostic_bundle_dir(
@@ -296,12 +332,14 @@ class EngineExecutionTimeoutDumper:
         scheduler_stats: SchedulerStats | None,
         timeout_s: float | None,
         stage: str,
+        scheduler_snapshot_fn: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         self.config = config
         self.scheduler_output = scheduler_output
         self.scheduler_stats = scheduler_stats
         self.timeout_s = timeout_s
         self.stage = stage
+        self.scheduler_snapshot_fn = scheduler_snapshot_fn
         self._timer: threading.Timer | None = None
 
     def __enter__(self) -> Self:
@@ -329,4 +367,14 @@ class EngineExecutionTimeoutDumper:
             self.scheduler_stats,
             self.timeout_s or 0,
             self.stage,
+            self._make_scheduler_snapshot(),
         )
+
+    def _make_scheduler_snapshot(self) -> dict[str, Any] | None:
+        if self.scheduler_snapshot_fn is None:
+            return None
+        try:
+            return self.scheduler_snapshot_fn()
+        except Exception:
+            logger.exception("Failed to collect V1 scheduler diagnostic snapshot")
+            return None

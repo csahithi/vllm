@@ -3,7 +3,7 @@
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 
@@ -241,6 +241,10 @@ class SchedulerInterface(ABC):
         The SchedulerStats object is created for every scheduling step.
         """
         raise NotImplementedError
+
+    def make_diagnostic_snapshot(self) -> dict[str, Any] | None:
+        """Make a best-effort snapshot for offline diagnostics."""
+        return None
 
     @abstractmethod
     def shutdown(self) -> None:

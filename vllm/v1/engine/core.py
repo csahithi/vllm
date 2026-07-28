@@ -504,6 +504,7 @@ class EngineCore:
                 scheduler_output,
                 self.scheduler.make_stats(),
                 error=err,
+                scheduler_snapshot=self.make_scheduler_diagnostic_snapshot(),
             )
             raise err
 
@@ -517,8 +518,16 @@ class EngineCore:
             scheduler_stats=self.scheduler.make_stats(),
             timeout_s=envs.VLLM_ENGINE_ITERATION_TIMEOUT_S,
             stage=stage,
+            scheduler_snapshot_fn=self.make_scheduler_diagnostic_snapshot,
         ):
             yield
+
+    def make_scheduler_diagnostic_snapshot(self) -> dict[str, Any] | None:
+        try:
+            return self.scheduler.make_diagnostic_snapshot()
+        except Exception:
+            logger.exception("Failed to collect V1 scheduler diagnostic snapshot")
+            return None
 
     @contextmanager
     def capture_iteration_details(
