@@ -500,7 +500,10 @@ class EngineCore:
 
             # NOTE: This method is exception-free
             dump_engine_exception(
-                self.vllm_config, scheduler_output, self.scheduler.make_stats()
+                self.vllm_config,
+                scheduler_output,
+                self.scheduler.make_stats(),
+                error=err,
             )
             raise err
 

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import time
 from collections import deque
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -140,6 +142,10 @@ def clear_engine_execution_timeout_dump_throttle():
         dump_input._engine_execution_timeout_dump_last_s.clear()
 
 
+def make_debug_dump_config(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(compile_debug_dump_path=lambda: tmp_path)
+
+
 def test_capture_iteration_details_disabled_without_log_stats():
     engine = make_fake_engine(log_stats=False)
 
@@ -258,12 +264,12 @@ def test_engine_execution_timeout_dumper_dumps_when_timer_fires(monkeypatch):
 
 
 def test_engine_execution_timeout_dump_is_throttled_by_stage(monkeypatch):
-    contexts: list[tuple[Any, ...]] = []
+    contexts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     tracebacks: list[dict[str, Any]] = []
     times = iter([100.0, 101.0, 102.0, 401.0])
 
-    def record_context(*args: Any) -> None:
-        contexts.append(args)
+    def record_context(*args: Any, **kwargs: Any) -> None:
+        contexts.append((args, kwargs))
 
     def record_traceback(*args: Any, **kwargs: Any) -> None:
         tracebacks.append(kwargs)
@@ -304,7 +310,86 @@ def test_engine_execution_timeout_dump_is_throttled_by_stage(monkeypatch):
 
     assert len(contexts) == 3
     assert len(tracebacks) == 3
-    assert all(context[0] == "timeout" for context in contexts)
+    assert all(context[0][0] == "timeout" for context in contexts)
+    assert all("stage" in context[1] for context in contexts)
+    assert all("timeout_s" in context[1] for context in contexts)
+
+    clear_engine_execution_timeout_dump_throttle()
+
+
+def test_engine_execution_context_writes_diagnostic_bundle(tmp_path):
+    scheduler_output = SimpleNamespace(request_id="req-1", token_ids=[1, 2, 3])
+    scheduler_stats = SchedulerStats(num_running_reqs=1)
+    error = RuntimeError("model execution failed")
+
+    bundle_dir = dump_input._dump_engine_execution_context(
+        reason="exception",
+        config=make_debug_dump_config(tmp_path),
+        scheduler_output=scheduler_output,
+        scheduler_stats=scheduler_stats,
+        error=error,
+    )
+
+    assert bundle_dir is not None
+    assert bundle_dir.parent == tmp_path / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+
+    context = json.loads((bundle_dir / "context.json").read_text(encoding="utf-8"))
+    assert context["bundle_version"] == dump_input.ENGINE_DIAGNOSTIC_BUNDLE_VERSION
+    assert context["reason"] == "exception"
+    assert context["stage"] is None
+    assert context["timeout_s"] is None
+    assert "req-1" in context["scheduler_output"]
+    assert "num_running_reqs=1" in context["scheduler_stats"]
+    assert context["exception"]["type"] == "builtins.RuntimeError"
+    assert context["exception"]["message"] == "model execution failed"
+
+
+def test_engine_execution_context_skips_bundle_without_debug_dump_path(tmp_path):
+    bundle_dir = dump_input._dump_engine_execution_context(
+        reason="exception",
+        config=SimpleNamespace(compile_debug_dump_path=lambda: None),
+        scheduler_output=SimpleNamespace(request_id="req-1"),
+        scheduler_stats=None,
+    )
+
+    assert bundle_dir is None
+    assert not (tmp_path / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR).exists()
+
+
+def test_engine_execution_timeout_writes_stack_bundle(tmp_path, monkeypatch):
+    stack_dumps: list[str] = []
+
+    def record_traceback(file, all_threads):
+        assert all_threads
+        file.write("stack dump\n")
+        file_name = str(getattr(file, "name", ""))
+        if file_name.endswith("stacks.txt"):
+            stack_dumps.append(file_name)
+
+    clear_engine_execution_timeout_dump_throttle()
+    monkeypatch.setattr(dump_input.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(dump_input.faulthandler, "dump_traceback", record_traceback)
+
+    dump_input.dump_engine_execution_timeout(
+        config=make_debug_dump_config(tmp_path),
+        scheduler_output=SimpleNamespace(request_id="req-2"),
+        scheduler_stats=SchedulerStats(num_waiting_reqs=2),
+        timeout_s=2.0,
+        stage=engine_core_module.EXECUTE_MODEL_WAIT_STAGE,
+    )
+
+    bundles = list((tmp_path / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR).iterdir())
+    assert len(bundles) == 1
+    assert (bundles[0] / "stacks.txt").read_text(encoding="utf-8") == "stack dump\n"
+
+    context = json.loads((bundles[0] / "context.json").read_text(encoding="utf-8"))
+    assert context["reason"] == "timeout"
+    assert context["stage"] == engine_core_module.EXECUTE_MODEL_WAIT_STAGE
+    assert context["timeout_s"] == 2.0
+    assert "req-2" in context["scheduler_output"]
+    assert "num_waiting_reqs=2" in context["scheduler_stats"]
+    assert context["exception"] is None
+    assert stack_dumps[0].endswith("stacks.txt")
 
     clear_engine_execution_timeout_dump_throttle()
 
