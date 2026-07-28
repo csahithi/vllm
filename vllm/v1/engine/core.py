@@ -30,8 +30,10 @@ from vllm.distributed import (
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import (
+    EngineCoreProgressMonitor,
     EngineExecutionTimeoutDumper,
     dump_engine_exception,
+    install_stack_trace_signal_handler,
 )
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -789,6 +791,9 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
+        progress_monitor = getattr(self, "progress_monitor", None)
+        if progress_monitor is not None:
+            progress_monitor.stop()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1117,6 +1122,17 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
+            self.progress_monitor = EngineCoreProgressMonitor(
+                config=vllm_config,
+                process_name=f"EngineCore_{self.engine_index}",
+                timeout_s=envs.VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S,
+                has_work_fn=self.has_work,
+                scheduler_stats_fn=self.scheduler.make_stats,
+                scheduler_snapshot_fn=self.make_scheduler_diagnostic_snapshot,
+            )
+            self.progress_monitor.record_progress("initialized")
+            self.progress_monitor.start()
+
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
             # and to overlap some serialization/deserialization with the
@@ -1317,6 +1333,7 @@ class EngineCoreProc(EngineCore):
             set_process_title(process_title)
             maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
             decorate_logs()
+            install_stack_trace_signal_handler(process_title)
             if parallel_config.numa_bind:
                 numa_utils.log_current_affinity_state(process_title)
 
@@ -1415,6 +1432,7 @@ class EngineCoreProc(EngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
+        self.progress_monitor.record_activity("process_input_queue")
         waited = False
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
@@ -1447,6 +1465,7 @@ class EngineCoreProc(EngineCore):
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
+        self.progress_monitor.record_activity("engine_step")
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
@@ -1454,10 +1473,24 @@ class EngineCoreProc(EngineCore):
         # Post-step hook.
         self.post_step(model_executed)
 
+        num_outputs = (
+            sum(len(eco.outputs) for eco in outputs.values()) if outputs else 0
+        )
+        has_pending_work = self.scheduler.has_requests()
+        if model_executed or num_outputs or not has_pending_work:
+            self.progress_monitor.record_progress(
+                "engine_step",
+                {
+                    "has_pending_work": has_pending_work,
+                    "model_executed": model_executed,
+                    "num_outputs": num_outputs,
+                },
+            )
+
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
-        if not model_executed and self.scheduler.has_requests():
+        if not model_executed and has_pending_work:
             time.sleep(0.001)
 
         return model_executed
@@ -1473,6 +1506,7 @@ class EngineCoreProc(EngineCore):
             return True
 
         if self.shutdown_state == EngineShutdownState.REQUESTED:
+            self.progress_monitor.record_progress("shutdown_requested")
             shutdown_timeout = self.vllm_config.shutdown_timeout
             mode = "abort" if shutdown_timeout == 0 else "drain"
 
@@ -1548,6 +1582,12 @@ class EngineCoreProc(EngineCore):
         else:
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
+            )
+            return
+
+        if request_type != EngineCoreRequestType.WAKEUP:
+            self.progress_monitor.record_progress(
+                f"client_request_{request_type.name.lower()}"
             )
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:
@@ -2043,6 +2083,7 @@ class DPEngineCoreProc(EngineCoreProc):
                         new_wave,
                     )
                     self.engines_running = True
+                self.progress_monitor.record_progress("client_request_start_dp_wave")
         else:
             super()._handle_client_request(request_type, request)
 
@@ -2079,8 +2120,10 @@ class DPEngineCoreProc(EngineCoreProc):
             self._maybe_publish_request_counts()
 
             if self.eep_scaling_state is not None:
+                self.progress_monitor.record_activity("elastic_ep_progress")
                 _ = self.eep_scaling_state.progress()
                 if self.eep_scaling_state.is_complete():
+                    self.progress_monitor.record_progress("elastic_ep_progress")
                     if self.eep_scaling_state.worker_type == "removing":
                         raise SystemExit
                     self.process_input_queue_block = True
@@ -2099,7 +2142,9 @@ class DPEngineCoreProc(EngineCoreProc):
                 # engine is sleeping.
                 elif not self.model_executor.is_sleeping:
                     with self.capture_iteration_details(None) as iteration_details:
+                        self.progress_monitor.record_activity("execute_dummy_batch")
                         self.execute_dummy_batch()
+                        self.progress_monitor.record_progress("execute_dummy_batch")
                     if iteration_details is not None and not self.has_coordinator:
                         stats = self._make_iteration_details_stats(iteration_details)
                         self.output_queue.put_nowait(
@@ -2107,8 +2152,12 @@ class DPEngineCoreProc(EngineCoreProc):
                         )
 
             # 3) All-reduce operation to determine global unfinished reqs.
+            self.progress_monitor.record_activity("dp_global_sync")
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
+            )
+            self.progress_monitor.record_progress(
+                "dp_global_sync", {"engines_running": self.engines_running}
             )
 
             if not self.engines_running:

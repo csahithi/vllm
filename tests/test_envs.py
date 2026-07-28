@@ -36,6 +36,22 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
+def test_stack_trace_signal_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_DEBUG_STACK_TRACE_SIGNAL", "SIGUSR1")
+
+    assert "VLLM_DEBUG_STACK_TRACE_SIGNAL" not in envs.compile_factors()
+
+
+def test_engine_no_progress_timeout_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S", "300")
+
+    assert "VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S" not in envs.compile_factors()
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

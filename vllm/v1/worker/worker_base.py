@@ -242,6 +242,10 @@ class WorkerWrapperBase:
 
         vllm_config.enable_trace_function_call_for_thread()
 
+        from vllm.logging_utils.dump_input import install_stack_trace_signal_handler
+
+        install_stack_trace_signal_handler(f"Worker_{self.global_rank}")
+
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()

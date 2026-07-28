@@ -171,6 +171,11 @@ async def build_async_engine_client_from_engine_args(
     client_count = client_config.pop("client_count", 1)
     client_index = client_config.pop("client_index", 0)
 
+    from vllm.logging_utils.dump_input import install_stack_trace_signal_handler
+
+    process_name = "APIServer" if client_count == 1 else f"APIServer_{client_index}"
+    install_stack_trace_signal_handler(process_name)
+
     try:
         async_llm = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
