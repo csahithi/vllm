@@ -46,9 +46,9 @@ If other strategies don't solve the problem, it's likely that the vLLM instance 
   disabled by default.
 - `export VLLM_DEBUG_DUMP_PATH=/path/to/debug-dumps` to write per-rank
   diagnostic bundles under `engine_diagnostics/` for offline analysis when
-  engine exception or timeout diagnostics are triggered. Bundles include
-  engine context, scheduler/request/KV-cache snapshots, and timeout stack
-  traces.
+  engine exception, timeout, no-progress, or process-death diagnostics are
+  triggered. Bundles include engine context, scheduler/request/KV-cache
+  snapshots, process exit status, and timeout stack traces when available.
 - `export VLLM_DEBUG_STACK_TRACE_SIGNAL=SIGUSR1` to install an on-demand
   Python stack trace handler in V1 API server, engine core, and worker
   processes. Send the configured signal to each vLLM process you want to

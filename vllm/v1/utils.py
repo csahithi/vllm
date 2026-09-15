@@ -573,9 +573,11 @@ def wait_for_completion_or_failure(
                         f"died with exit code {proc.exitcode}"
                     )
                 if engine_manager and engine_manager.failed_proc_name is not None:
+                    finished_procs = engine_manager.finished_procs()
                     raise RuntimeError(
                         f"Engine core process {engine_manager.failed_proc_name} "
-                        "died unexpectedly."
+                        "died unexpectedly. Finished engine processes: "
+                        f"{finished_procs}"
                     )
 
     except KeyboardInterrupt:

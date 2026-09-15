@@ -699,8 +699,12 @@ class MPClient(EngineCoreClient):
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
             _self.resources.engine_dead = True
+            _self.resources.failed_proc_name = engine_manager.failed_proc_name
             logger.warning_once(
-                "[shutdown] MPClient: engine core exited unexpectedly; starting cleanup"
+                "[shutdown] MPClient: engine core exited unexpectedly "
+                "(failed_proc=%s, finished_procs=%s); starting cleanup",
+                engine_manager.failed_proc_name,
+                engine_manager.finished_procs(),
             )
             _self.shutdown()
             # Note: For MPClient, we don't have a failure callback mechanism

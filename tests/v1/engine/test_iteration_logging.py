@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import signal
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -11,6 +12,8 @@ from typing import Any, cast
 
 import vllm.v1.core.sched.scheduler as scheduler_module
 import vllm.v1.engine.core as engine_core_module
+import vllm.v1.engine.utils as engine_utils
+import vllm.v1.executor.multiproc_executor as multiproc_executor_module
 from vllm.logging_utils import dump_input
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.engine.core import EngineCore
@@ -158,6 +161,21 @@ class FakeProgressMonitor:
         self, stage: str, details: dict[str, Any] | None = None
     ) -> None:
         self.progress.append((stage, details))
+
+
+class FakeProc:
+    def __init__(
+        self,
+        name: str,
+        *,
+        pid: int,
+        exitcode: int | None,
+        sentinel: int,
+    ) -> None:
+        self.name = name
+        self.pid = pid
+        self.exitcode = exitcode
+        self.sentinel = sentinel
 
 
 def clear_engine_execution_timeout_dump_throttle():
@@ -702,9 +720,7 @@ def test_process_engine_step_records_output_progress():
     progress_monitor = FakeProgressMonitor()
     queued_outputs: list[tuple[int, Any]] = []
     engine_outputs = EngineCoreOutputs(
-        outputs=[
-            EngineCoreOutput(request_id="req-1", new_token_ids=[1])
-        ]
+        outputs=[EngineCoreOutput(request_id="req-1", new_token_ids=[1])]
     )
     engine = SimpleNamespace(
         progress_monitor=progress_monitor,
@@ -811,6 +827,160 @@ def test_engine_execution_timeout_writes_stack_bundle(tmp_path, monkeypatch):
     assert stack_dumps[0].endswith("stacks.txt")
 
     clear_engine_execution_timeout_dump_throttle()
+
+
+def test_describe_process_exit_identifies_signal_exit():
+    signum = int(signal.SIGTERM)
+    status = dump_input.describe_process_exit(-signum)
+
+    assert status == {
+        "exit_code": -signum,
+        "signal_name": signal.Signals(signum).name,
+        "signal_number": signum,
+        "status": "signal",
+    }
+    assert dump_input.format_process_exit(-signum) == (
+        f"signal {signal.Signals(signum).name} ({signum})"
+    )
+
+
+def test_process_death_diagnostics_writes_bundle(tmp_path):
+    signum = int(signal.SIGTERM)
+
+    bundle_dir = dump_input.dump_process_death_diagnostics(
+        make_debug_dump_config(tmp_path),
+        process_kind="worker",
+        process_name="WorkerProc-0",
+        pid=1234,
+        exitcode=-signum,
+        details={"rank": 0, "world_size": 2},
+    )
+
+    assert bundle_dir is not None
+    assert bundle_dir.parent == tmp_path / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+
+    context = json.loads((bundle_dir / "context.json").read_text(encoding="utf-8"))
+    assert context["reason"] == "process_death"
+    assert context["stage"] == "worker"
+    assert context["process_death"] == {
+        "details": {"rank": 0, "world_size": 2},
+        "exit_code": -signum,
+        "pid": 1234,
+        "process_kind": "worker",
+        "process_name": "WorkerProc-0",
+        "signal_name": signal.Signals(signum).name,
+        "signal_number": signum,
+        "status": "signal",
+    }
+
+
+def test_core_engine_proc_manager_dumps_failed_process(monkeypatch):
+    signum = int(signal.SIGTERM)
+    proc = FakeProc(
+        "EngineCore",
+        pid=1234,
+        exitcode=-signum,
+        sentinel=17,
+    )
+    manager = cast(Any, object.__new__(engine_utils.CoreEngineProcManager))
+    manager.processes = [proc]
+    manager.manager_stopped = SimpleNamespace(is_set=lambda: False)
+    manager.failed_proc_name = None
+    manager.vllm_config = SimpleNamespace()
+    shutdown_calls: list[float | None] = []
+    manager.shutdown = lambda timeout=None: shutdown_calls.append(timeout)
+    diagnostics: list[dict[str, Any]] = []
+
+    def record_diagnostics(config, **kwargs):
+        diagnostics.append(kwargs)
+
+    monkeypatch.setattr(
+        engine_utils.connection,
+        "wait",
+        lambda sentinels, timeout: [proc.sentinel],
+    )
+    monkeypatch.setattr(
+        engine_utils,
+        "dump_process_death_diagnostics",
+        record_diagnostics,
+    )
+
+    engine_utils.CoreEngineProcManager.monitor_engine_liveness(manager)
+
+    assert manager.failed_proc_name == "EngineCore"
+    assert shutdown_calls == [None]
+    assert diagnostics == [
+        {
+            "process_kind": "engine_core",
+            "process_name": "EngineCore",
+            "pid": 1234,
+            "exitcode": -signum,
+            "details": {
+                "finished_processes": {"EngineCore": -signum},
+                "local_engine_count": 1,
+            },
+        }
+    ]
+
+
+def test_multiproc_worker_monitor_dumps_failed_worker(monkeypatch):
+    signum = int(signal.SIGTERM)
+    proc = FakeProc(
+        "WorkerProc-2",
+        pid=2345,
+        exitcode=-signum,
+        sentinel=29,
+    )
+    worker = SimpleNamespace(proc=proc, rank=2)
+    executor = cast(Any, object.__new__(multiproc_executor_module.MultiprocExecutor))
+    executor.workers = [worker]
+    executor.vllm_config = SimpleNamespace()
+    executor.local_world_size = 4
+    executor.world_size = 8
+    executor.is_failed = False
+    executor.shutting_down = False
+    shutdown_calls: list[bool] = []
+    callback_calls: list[bool] = []
+    executor.shutdown = lambda: shutdown_calls.append(True)
+    executor.failure_callback = lambda: callback_calls.append(True)
+    diagnostics: list[dict[str, Any]] = []
+
+    def record_diagnostics(config, **kwargs):
+        diagnostics.append(kwargs)
+
+    monkeypatch.setattr(
+        multiproc_executor_module.multiprocessing.connection,
+        "wait",
+        lambda sentinels: [proc.sentinel],
+    )
+    monkeypatch.setattr(
+        multiproc_executor_module,
+        "dump_process_death_diagnostics",
+        record_diagnostics,
+    )
+
+    multiproc_executor_module.MultiprocExecutor.start_worker_monitor(
+        executor, inline=True
+    )
+
+    assert executor.is_failed
+    assert executor.failure_callback is None
+    assert shutdown_calls == [True]
+    assert callback_calls == [True]
+    assert diagnostics == [
+        {
+            "process_kind": "worker",
+            "process_name": "WorkerProc-2",
+            "pid": 2345,
+            "exitcode": -signum,
+            "details": {
+                "finished_workers": {2: -signum},
+                "local_world_size": 4,
+                "rank": 2,
+                "world_size": 8,
+            },
+        }
+    ]
 
 
 def test_dump_on_slow_execution_uses_env_timeout_and_scheduler_stats(monkeypatch):

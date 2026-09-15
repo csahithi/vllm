@@ -19,6 +19,7 @@ import zmq
 from vllm import envs
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
+from vllm.logging_utils.dump_input import dump_process_death_diagnostics
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.utils import numa_utils
@@ -173,6 +174,7 @@ class CoreEngineProcManager:
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
+        self.vllm_config = vllm_config
 
         # All ranks share this config object: capture the user-provided
         # --device-ids list before the per-rank shard overwrites it. Mutating
@@ -233,6 +235,17 @@ class CoreEngineProcManager:
                 exitcode = proc.exitcode
                 if exitcode != 0 and not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
+                    dump_process_death_diagnostics(
+                        self.vllm_config,
+                        process_kind="engine_core",
+                        process_name=proc.name,
+                        pid=proc.pid,
+                        exitcode=exitcode,
+                        details={
+                            "finished_processes": self.finished_procs(),
+                            "local_engine_count": len(self.processes),
+                        },
+                    )
             if died_sentinels:
                 # Any engine exit currently triggers a shutdown. Future
                 # work (e.g., Elastic and fault-tolerant EP) will add finer-grained

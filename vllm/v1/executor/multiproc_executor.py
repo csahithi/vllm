@@ -42,6 +42,10 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
+from vllm.logging_utils.dump_input import (
+    dump_process_death_diagnostics,
+    format_process_exit,
+)
 from vllm.platforms import current_platform
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
@@ -284,19 +288,40 @@ class MultiprocExecutor(Executor):
         # logs an error, shuts down the executor and invokes the failure
         # callback to inform the engine.
         def monitor_workers():
-            sentinels = [h.proc.sentinel for h in workers]
+            sentinel_to_worker = {h.proc.sentinel: h for h in workers}
+            sentinels = list(sentinel_to_worker.keys())
             died = multiprocessing.connection.wait(sentinels)
             _self = self_ref()
             if not _self or getattr(_self, "shutting_down", False):
                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
                 return
             _self.is_failed = True
-            proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
+            worker = sentinel_to_worker[died[0]]
+            proc = worker.proc
+            dump_process_death_diagnostics(
+                _self.vllm_config,
+                process_kind="worker",
+                process_name=proc.name,
+                pid=proc.pid,
+                exitcode=proc.exitcode,
+                details={
+                    "finished_workers": {
+                        h.rank: h.proc.exitcode
+                        for h in workers
+                        if h.proc.exitcode is not None
+                    },
+                    "local_world_size": _self.local_world_size,
+                    "rank": worker.rank,
+                    "world_size": _self.world_size,
+                },
+            )
             logger.error(
-                "Worker proc %s died unexpectedly (exit code: %s), "
+                "Worker proc %s (pid=%s, rank=%d) died unexpectedly (%s), "
                 "shutting down executor.",
                 proc.name,
-                proc.exitcode,
+                proc.pid,
+                worker.rank,
+                format_process_exit(proc.exitcode),
             )
             _self.shutdown()
             callback = _self.failure_callback
