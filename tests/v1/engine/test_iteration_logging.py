@@ -7,6 +7,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import fields
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -250,6 +251,12 @@ def make_timeout_snapshot(
         scheduler_output or make_timeout_scheduler_output(),
         scheduler_state,
     )
+
+
+def make_debug_dump_config(tmp_path: Path) -> SimpleNamespace:
+    config = make_timeout_config()
+    config.compile_debug_dump_path = lambda: tmp_path
+    return config
 
 
 def test_capture_iteration_details_disabled_without_log_stats():
@@ -595,6 +602,83 @@ def test_engine_execution_timeout_context_failure_is_reported(monkeypatch):
 
     assert errors == ["Failed to dump V1 engine timeout context"]
     assert traceback_dumped.is_set()
+
+
+def test_engine_execution_context_writes_diagnostic_bundle(tmp_path):
+    scheduler_output = SimpleNamespace(request_id="req-1", token_ids=[1, 2, 3])
+    scheduler_stats = SchedulerStats(num_running_reqs=1)
+    error = RuntimeError("model execution failed")
+
+    bundle_dir = dump_input._dump_engine_execution_context(
+        reason="exception",
+        config=make_debug_dump_config(tmp_path),
+        scheduler_output=scheduler_output,
+        scheduler_stats=scheduler_stats,
+        error=error,
+    )
+
+    assert bundle_dir is not None
+    assert bundle_dir.parent == tmp_path / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+
+    context = json.loads((bundle_dir / "context.json").read_text(encoding="utf-8"))
+    assert context["bundle_version"] == dump_input.ENGINE_DIAGNOSTIC_BUNDLE_VERSION
+    assert context["reason"] == "exception"
+    assert context["stage"] is None
+    assert context["timeout_s"] is None
+    assert "req-1" in context["scheduler_output"]
+    assert "num_running_reqs=1" in context["scheduler_stats"]
+    assert context["exception"]["type"] == "builtins.RuntimeError"
+    assert context["exception"]["message"] == "model execution failed"
+
+
+def test_engine_execution_context_skips_bundle_without_debug_dump_path(tmp_path):
+    bundle_dir = dump_input._dump_engine_execution_context(
+        reason="exception",
+        config=SimpleNamespace(compile_debug_dump_path=lambda: None),
+        scheduler_output=SimpleNamespace(request_id="req-1"),
+        scheduler_stats=None,
+    )
+
+    assert bundle_dir is None
+    assert not (tmp_path / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR).exists()
+
+
+def test_engine_execution_timeout_writes_stack_bundle(tmp_path, monkeypatch):
+    stack_dumps: list[str] = []
+
+    def record_traceback(file, all_threads):
+        assert all_threads
+        file.write("stack dump\n")
+        file_name = str(getattr(file, "name", ""))
+        if file_name.endswith("stacks.txt"):
+            stack_dumps.append(file_name)
+
+    monkeypatch.setattr(dump_input.faulthandler, "dump_traceback", record_traceback)
+    scheduler_output = make_timeout_scheduler_output()
+    scheduler_output.scheduled_new_reqs[0].req_id = "req-2"
+
+    dump_input.dump_engine_execution_timeout(
+        config=make_debug_dump_config(tmp_path),
+        snapshot=make_timeout_snapshot(
+            scheduler_output,
+            scheduler_state={"num_waiting_reqs": 2},
+        ),
+        timeout_s=2.0,
+        stage=engine_core_module.EXECUTE_MODEL_WAIT_STAGE,
+    )
+
+    bundles = list((tmp_path / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR).iterdir())
+    assert len(bundles) == 1
+    assert (bundles[0] / "stacks.txt").read_text(encoding="utf-8") == "stack dump\n"
+
+    context = json.loads((bundles[0] / "context.json").read_text(encoding="utf-8"))
+    assert context["reason"] == "timeout"
+    assert context["stage"] == engine_core_module.EXECUTE_MODEL_WAIT_STAGE
+    assert context["timeout_s"] == 2.0
+    assert "req-2" in context["scheduler_output"]
+    assert '"num_waiting_reqs": 2' in context["scheduler_stats"]
+    assert context["exception"] is None
+    assert stack_dumps[0].endswith("stacks.txt")
 
 
 def test_engine_execution_timeout_watchdog_fires_twice_on_same_thread(monkeypatch):
