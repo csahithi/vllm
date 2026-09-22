@@ -2,13 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
+import stat
 import threading
 import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import fields
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 import vllm.v1.engine.core as engine_core_module
 from vllm.config import ModelConfig, SpeculativeConfig, VllmConfig
@@ -227,8 +232,10 @@ def make_timeout_config() -> SimpleNamespace:
             uva=SimpleNamespace(cpu_offload_gb=0),
         ),
         parallel_config=SimpleNamespace(
+            data_parallel_index=0,
             data_parallel_size=1,
             pipeline_parallel_size=1,
+            rank=0,
             tensor_parallel_size=2,
         ),
         scheduler_config=SimpleNamespace(
@@ -250,6 +257,15 @@ def make_timeout_snapshot(
         scheduler_output or make_timeout_scheduler_output(),
         scheduler_state,
     )
+
+
+def enable_engine_diagnostic_bundles(monkeypatch, tmp_path: Path) -> SimpleNamespace:
+    monkeypatch.setattr(
+        dump_input.envs,
+        "VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH",
+        str(tmp_path),
+    )
+    return make_timeout_config()
 
 
 def test_capture_iteration_details_disabled_without_log_stats():
@@ -388,6 +404,9 @@ def test_engine_execution_timeout_watchdog_ignores_stale_disarm(monkeypatch):
         ] == ("current-generation-request")
         assert snapshot.scheduler_queue_summary == {"snapshot": 2}
         assert stage == engine_core_module.SAMPLE_TOKENS_STAGE
+        diagnostic_thread = watchdog._diagnostic_thread
+        assert diagnostic_thread is not None
+        diagnostic_thread.join(timeout=1.0)
     finally:
         watchdog.stop()
 
@@ -441,12 +460,21 @@ def test_engine_execution_timeout_watchdog_keeps_arm_and_stop_nonblocking(
 ):
     dump_started = threading.Event()
     release_dump = threading.Event()
+    skipped_dump_emitted = threading.Event()
+    dump_calls = 0
 
     def blocking_dump(*args):
+        nonlocal dump_calls
+        dump_calls += 1
         dump_started.set()
         assert release_dump.wait(timeout=2.0)
 
     monkeypatch.setattr(dump_input, "dump_engine_execution_timeout", blocking_dump)
+    monkeypatch.setattr(
+        dump_input,
+        "_emit_engine_execution_timeout",
+        lambda *args: skipped_dump_emitted.set(),
+    )
     monkeypatch.setattr(
         dump_input,
         "ENGINE_EXECUTION_TIMEOUT_WATCHDOG_STOP_TIMEOUT_S",
@@ -482,6 +510,8 @@ def test_engine_execution_timeout_watchdog_keeps_arm_and_stop_nonblocking(
         assert arm_finished.wait(timeout=1.0)
         arm_thread.join(timeout=1.0)
         assert generations[0] is not None
+        assert skipped_dump_emitted.wait(timeout=1.0)
+        assert dump_calls == 1
 
         def stop_watchdog():
             watchdog.stop()
@@ -492,15 +522,21 @@ def test_engine_execution_timeout_watchdog_keeps_arm_and_stop_nonblocking(
         assert stop_finished.wait(timeout=1.0)
         stop_thread.join(timeout=1.0)
         assert watchdog._thread is not None
-        assert watchdog._thread.is_alive()
+        assert not watchdog._thread.is_alive()
+        assert watchdog._diagnostic_thread is not None
+        assert watchdog._diagnostic_thread.is_alive()
     finally:
         release_dump.set()
         watchdog.stop()
         if watchdog._thread is not None:
             watchdog._thread.join(timeout=1.0)
+        if watchdog._diagnostic_thread is not None:
+            watchdog._diagnostic_thread.join(timeout=1.0)
 
     assert watchdog._thread is not None
     assert not watchdog._thread.is_alive()
+    assert watchdog._diagnostic_thread is not None
+    assert not watchdog._diagnostic_thread.is_alive()
 
 
 def test_engine_execution_timeout_watchdog_disarm_suppresses_dump(monkeypatch):
@@ -554,6 +590,10 @@ def test_engine_execution_timeout_real_timeout_emits_useful_summary(monkeypatch)
             engine_core_module.EXECUTE_MODEL_WAIT_STAGE,
         )
         assert traceback_dumped.wait(timeout=1.0)
+        diagnostic_thread = watchdog._diagnostic_thread
+        assert diagnostic_thread is not None
+        diagnostic_thread.join(timeout=1.0)
+        assert not diagnostic_thread.is_alive()
     finally:
         watchdog.stop()
 
@@ -597,7 +637,361 @@ def test_engine_execution_timeout_context_failure_is_reported(monkeypatch):
     assert traceback_dumped.is_set()
 
 
-def test_engine_execution_timeout_watchdog_fires_twice_on_same_thread(monkeypatch):
+def test_log_error_detail_forwards_and_reraises_original_error(monkeypatch):
+    config = object()
+    scheduler_output = object()
+    scheduler_stats = object()
+    engine = SimpleNamespace(
+        vllm_config=config,
+        scheduler=SimpleNamespace(make_stats=lambda: scheduler_stats),
+    )
+    calls = []
+
+    def record_dump(actual_config, actual_output, actual_stats, *, error):
+        calls.append((actual_config, actual_output, actual_stats, error))
+
+    monkeypatch.setattr(engine_core_module, "dump_engine_exception", record_dump)
+    error = RuntimeError("execute failed")
+
+    with (
+        pytest.raises(RuntimeError) as caught,
+        EngineCore.log_error_detail(engine, scheduler_output),
+    ):
+        raise error
+
+    assert caught.value is error
+    assert calls == [(config, scheduler_output, scheduler_stats, error)]
+
+
+def test_engine_execution_context_writes_diagnostic_bundle(tmp_path, monkeypatch):
+    scheduler_output = SimpleNamespace(request_id="req-1", token_ids=[1, 2, 3])
+    scheduler_stats = SchedulerStats(num_running_reqs=1)
+    error = RuntimeError("model execution failed")
+
+    bundle_dir = dump_input._dump_engine_execution_context(
+        reason="exception",
+        config=enable_engine_diagnostic_bundles(monkeypatch, tmp_path),
+        scheduler_output=scheduler_output,
+        scheduler_stats=scheduler_stats,
+        error=error,
+    )
+
+    assert bundle_dir is not None
+    assert bundle_dir.parent == (
+        tmp_path / "rank_0_dp_0" / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+    )
+
+    context = json.loads((bundle_dir / "context.json").read_text(encoding="utf-8"))
+    assert context["bundle_version"] == dump_input.ENGINE_DIAGNOSTIC_BUNDLE_VERSION
+    assert context["reason"] == "exception"
+    assert context["stage"] is None
+    assert context["timeout_s"] is None
+    assert context["scheduler_output_summary"] is None
+    assert context["scheduler_queue_summary"] is None
+    assert "req-1" in context["scheduler_output_text"]
+    assert "num_running_reqs=1" in context["scheduler_stats_text"]
+    assert context["exception"]["type"] == "builtins.RuntimeError"
+    assert context["exception"]["message"] == "model execution failed"
+    assert json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8")) == {
+        "artifacts": {"context.json": "written"},
+        "bundle_version": dump_input.ENGINE_DIAGNOSTIC_BUNDLE_VERSION,
+        "complete": True,
+        "files": ["context.json"],
+    }
+    if os.name != "nt":
+        assert stat.S_IMODE(bundle_dir.parent.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(bundle_dir.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(bundle_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE((bundle_dir / "context.json").stat().st_mode) == 0o600
+        assert stat.S_IMODE((bundle_dir / "manifest.json").stat().st_mode) == 0o600
+
+
+def test_engine_execution_context_ignores_compilation_debug_dump_path(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(dump_input.envs, "VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH", None)
+    bundle_dir = dump_input._dump_engine_execution_context(
+        reason="exception",
+        config=SimpleNamespace(compile_debug_dump_path=lambda: tmp_path),
+        scheduler_output=SimpleNamespace(request_id="req-1"),
+        scheduler_stats=None,
+    )
+
+    assert bundle_dir is None
+    assert not (tmp_path / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR).exists()
+
+
+def test_engine_execution_timeout_writes_stack_bundle(tmp_path, monkeypatch):
+    def record_traceback(file, all_threads):
+        assert all_threads
+        try:
+            file.write("stack dump\n")
+        except TypeError:
+            file.write(b"stack dump\n")
+
+    monkeypatch.setattr(dump_input.faulthandler, "dump_traceback", record_traceback)
+    scheduler_output = make_timeout_scheduler_output()
+    scheduler_output.scheduled_new_reqs[0].req_id = "req-2"
+
+    dump_input.dump_engine_execution_timeout(
+        config=enable_engine_diagnostic_bundles(monkeypatch, tmp_path),
+        snapshot=make_timeout_snapshot(
+            scheduler_output,
+            scheduler_state={"num_waiting_reqs": 2},
+        ),
+        timeout_s=2.0,
+        stage=engine_core_module.EXECUTE_MODEL_WAIT_STAGE,
+    )
+
+    dump_root = tmp_path / "rank_0_dp_0" / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+    bundles = list(dump_root.iterdir())
+    assert len(bundles) == 1
+    assert (bundles[0] / "stacks.txt").read_text(encoding="utf-8") == "stack dump\n"
+
+    context = json.loads((bundles[0] / "context.json").read_text(encoding="utf-8"))
+    assert context["reason"] == "timeout"
+    assert context["stage"] == engine_core_module.EXECUTE_MODEL_WAIT_STAGE
+    assert context["timeout_s"] == 2.0
+    assert context["scheduler_output_text"] is None
+    assert context["scheduler_stats_text"] is None
+    assert (
+        context["scheduler_output_summary"]["request_samples"][0]["request_id"]
+        == "req-2"
+    )
+    assert context["scheduler_queue_summary"]["num_waiting_reqs"] == 2
+    assert context["exception"] is None
+    manifest = json.loads((bundles[0] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["complete"] is True
+    assert manifest["artifacts"] == {
+        "context.json": "written",
+        "stacks.txt": "written",
+    }
+    assert manifest["files"] == ["context.json", "stacks.txt"]
+
+
+def test_engine_execution_timeout_stack_failure_is_fail_open(tmp_path, monkeypatch):
+    stderr_dumped = threading.Event()
+    real_mkstemp = dump_input.tempfile.mkstemp
+
+    def fail_stack_file(*args, **kwargs):
+        if kwargs.get("prefix") == ".stacks.txt.":
+            raise OSError("disk full")
+        return real_mkstemp(*args, **kwargs)
+
+    def record_traceback(file, all_threads):
+        assert all_threads
+        if file is dump_input.sys.stderr:
+            stderr_dumped.set()
+
+    monkeypatch.setattr(dump_input.tempfile, "mkstemp", fail_stack_file)
+    monkeypatch.setattr(dump_input.faulthandler, "dump_traceback", record_traceback)
+
+    dump_input.dump_engine_execution_timeout(
+        config=enable_engine_diagnostic_bundles(monkeypatch, tmp_path),
+        snapshot=make_timeout_snapshot(),
+        timeout_s=2.0,
+        stage=engine_core_module.EXECUTE_MODEL_WAIT_STAGE,
+    )
+
+    dump_root = tmp_path / "rank_0_dp_0" / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+    bundles = list(dump_root.iterdir())
+    assert stderr_dumped.is_set()
+    assert len(bundles) == 1
+    manifest = json.loads((bundles[0] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["complete"] is False
+    assert manifest["artifacts"] == {
+        "context.json": "written",
+        "stacks.txt": "failed",
+    }
+    assert manifest["files"] == ["context.json"]
+
+
+def test_engine_diagnostic_atomic_replace_failure_does_not_close_owned_fd(
+    tmp_path, monkeypatch
+):
+    close_calls = []
+    real_close = os.close
+
+    def record_close(fd):
+        close_calls.append(fd)
+        real_close(fd)
+
+    def fail_replace(*args):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(dump_input.os, "close", record_close)
+    monkeypatch.setattr(dump_input.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="read-only filesystem"):
+        dump_input._write_private_text_atomic(
+            tmp_path / "context.json",
+            "{}",
+            max_bytes=dump_input.ENGINE_DIAGNOSTIC_CONTEXT_MAX_BYTES,
+        )
+
+    assert close_calls == []
+    assert not list(tmp_path.iterdir())
+
+
+def test_engine_diagnostic_bundle_retention_is_bounded(tmp_path, monkeypatch):
+    config = enable_engine_diagnostic_bundles(monkeypatch, tmp_path)
+    monkeypatch.setattr(dump_input, "ENGINE_DIAGNOSTIC_MAX_BUNDLES", 2)
+
+    for request_id in ("req-1", "req-2", "req-3"):
+        assert (
+            dump_input._dump_engine_execution_context(
+                reason="exception",
+                config=config,
+                scheduler_output=SimpleNamespace(request_id=request_id),
+                scheduler_stats=None,
+            )
+            is not None
+        )
+
+    dump_root = tmp_path / "rank_0_dp_0" / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+    bundles = list(dump_root.iterdir())
+    assert len(bundles) == 2
+    assert all((bundle / "manifest.json").is_file() for bundle in bundles)
+    retained_outputs = {
+        json.loads((bundle / "context.json").read_text(encoding="utf-8"))[
+            "scheduler_output_text"
+        ]
+        for bundle in bundles
+    }
+    assert all("req-1" not in output for output in retained_outputs)
+    assert any("req-2" in output for output in retained_outputs)
+    assert any("req-3" in output for output in retained_outputs)
+
+
+def test_engine_diagnostic_prune_removes_only_stale_incomplete_bundles(tmp_path):
+    stale = tmp_path / f"{dump_input.ENGINE_DIAGNOSTIC_BUNDLE_PREFIX}stale"
+    fresh = tmp_path / f"{dump_input.ENGINE_DIAGNOSTIC_BUNDLE_PREFIX}fresh"
+    stale.mkdir()
+    fresh.mkdir()
+    expired = time.time() - dump_input.ENGINE_DIAGNOSTIC_INCOMPLETE_MAX_AGE_S - 1
+    os.utime(stale, (expired, expired))
+
+    dump_input._prune_engine_diagnostic_bundles(tmp_path)
+
+    assert not stale.exists()
+    assert fresh.is_dir()
+
+
+def test_new_bundle_prunes_stale_incomplete_bundle_before_write(tmp_path, monkeypatch):
+    config = enable_engine_diagnostic_bundles(monkeypatch, tmp_path)
+    dump_root = tmp_path / "rank_0_dp_0" / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+    stale = dump_root / f"{dump_input.ENGINE_DIAGNOSTIC_BUNDLE_PREFIX}stale"
+    stale.mkdir(parents=True)
+    expired = time.time() - dump_input.ENGINE_DIAGNOSTIC_INCOMPLETE_MAX_AGE_S - 1
+    os.utime(stale, (expired, expired))
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dump_input, "_write_engine_diagnostic_json", fail_write)
+
+    assert (
+        dump_input._dump_engine_execution_context(
+            reason="exception",
+            config=config,
+            scheduler_output=SimpleNamespace(request_id="req-1"),
+            scheduler_stats=None,
+        )
+        is None
+    )
+    assert not list(dump_root.iterdir())
+
+
+def test_engine_diagnostic_bundle_write_failure_leaves_no_partial_bundle(
+    tmp_path, monkeypatch
+):
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dump_input, "_write_engine_diagnostic_json", fail_write)
+
+    assert (
+        dump_input._write_engine_diagnostic_bundle(
+            reason="exception",
+            config=make_timeout_config(),
+            dump_root=tmp_path,
+            config_summary={},
+            scheduler_output_summary=None,
+            scheduler_queue_summary=None,
+            scheduler_output_text=None,
+            scheduler_stats_text=None,
+            stage=None,
+            timeout_s=None,
+            error=None,
+        )
+        is None
+    )
+    assert not list(tmp_path.iterdir())
+
+
+def test_engine_diagnostic_manifest_failure_removes_partial_bundle(
+    tmp_path, monkeypatch
+):
+    config = enable_engine_diagnostic_bundles(monkeypatch, tmp_path)
+    real_write = dump_input._write_engine_diagnostic_json
+
+    def fail_manifest(path, value, *, max_bytes):
+        if path.name == "manifest.json":
+            raise OSError("disk full")
+        return real_write(path, value, max_bytes=max_bytes)
+
+    monkeypatch.setattr(dump_input, "_write_engine_diagnostic_json", fail_manifest)
+
+    result = dump_input._dump_engine_execution_context(
+        reason="exception",
+        config=config,
+        scheduler_output=SimpleNamespace(request_id="req-1"),
+        scheduler_stats=None,
+    )
+
+    dump_root = tmp_path / "rank_0_dp_0" / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+    assert result is None
+    assert not list(dump_root.iterdir())
+
+
+def test_engine_exception_bundle_write_timeout_is_fail_open(tmp_path, monkeypatch):
+    write_started = threading.Event()
+    release_write = threading.Event()
+    write_finished = threading.Event()
+
+    def block_write(**kwargs):
+        write_started.set()
+        release_write.wait(timeout=1.0)
+        write_finished.set()
+        return None
+
+    monkeypatch.setattr(dump_input, "_write_engine_diagnostic_bundle", block_write)
+    monkeypatch.setattr(dump_input, "ENGINE_DIAGNOSTIC_WRITE_TIMEOUT_S", 0.01)
+
+    try:
+        result = dump_input._write_engine_diagnostic_bundle_with_timeout(
+            reason="exception",
+            config=make_timeout_config(),
+            dump_root=tmp_path,
+            config_summary={},
+            scheduler_output_summary=None,
+            scheduler_queue_summary=None,
+            scheduler_output_text=None,
+            scheduler_stats_text=None,
+            stage=None,
+            timeout_s=None,
+            error=None,
+        )
+        assert not write_finished.is_set()
+    finally:
+        release_write.set()
+
+    assert write_started.is_set()
+    assert result is None
+    assert write_finished.wait(timeout=1.0)
+
+
+def test_engine_execution_timeout_watchdog_reuses_control_thread(monkeypatch):
     dumped_stages = []
     dump_completed = threading.Event()
 
@@ -621,6 +1015,10 @@ def test_engine_execution_timeout_watchdog_fires_twice_on_same_thread(monkeypatc
             dump_completed.clear()
             watchdog.arm(make_timeout_snapshot(), stage)
             assert dump_completed.wait(timeout=1.0)
+            diagnostic_thread = watchdog._diagnostic_thread
+            assert diagnostic_thread is not None
+            diagnostic_thread.join(timeout=1.0)
+            assert not diagnostic_thread.is_alive()
         assert watchdog._thread is thread
         assert dumped_stages == [
             engine_core_module.EXECUTE_MODEL_WAIT_STAGE,

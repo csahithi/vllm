@@ -54,6 +54,20 @@ def test_engine_slow_stage_dump_environment_variable(monkeypatch: pytest.MonkeyP
     assert slow_stage_dump() == 30
 
 
+def test_engine_diagnostic_dump_path_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    diagnostic_dump_path = environment_variables["VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH"]
+    monkeypatch.delenv("VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH", raising=False)
+
+    assert diagnostic_dump_path() is None
+
+    monkeypatch.setenv("VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH", "/diagnostics")
+
+    assert diagnostic_dump_path() == "/diagnostics"
+    assert "VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH" not in envs.compile_factors()
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)
