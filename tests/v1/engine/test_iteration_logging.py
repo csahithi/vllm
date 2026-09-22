@@ -11,10 +11,11 @@ from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+import vllm.v1.core.sched.scheduler as scheduler_module
 import vllm.v1.engine.core as engine_core_module
 from vllm.config import ModelConfig, SpeculativeConfig, VllmConfig
 from vllm.logging_utils import dump_input
@@ -266,6 +267,131 @@ def enable_engine_diagnostic_bundles(monkeypatch, tmp_path: Path) -> SimpleNames
         str(tmp_path),
     )
     return make_timeout_config()
+
+
+def make_diagnostic_request(
+    request_id: str,
+    *,
+    arrival_time: float,
+    status,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        arrival_time=arrival_time,
+        status=status,
+        ec_transfer_params=None,
+        kv_transfer_params=None,
+        lora_request=None,
+        pooling_params=None,
+        sampling_params=SimpleNamespace(max_tokens=4),
+        is_prefill_chunk=False,
+        max_tokens=4,
+        num_computed_tokens=3,
+        num_encoder_inputs=1,
+        num_in_flight_tokens=2,
+        num_output_tokens=1,
+        num_preemptions=1,
+        num_prompt_tokens=8,
+        spec_token_ids=[1, 2],
+        num_tokens=9,
+        priority=0,
+        use_structured_output=False,
+    )
+
+
+def test_scheduler_diagnostic_snapshot_summarizes_requests_and_resources(
+    monkeypatch,
+):
+    scheduler = cast(Any, object.__new__(scheduler_module.Scheduler))
+    running_req = make_diagnostic_request(
+        "running-req",
+        arrival_time=990.0,
+        status=scheduler_module.RequestStatus.RUNNING,
+    )
+    waiting_req = make_diagnostic_request(
+        "waiting-req",
+        arrival_time=980.0,
+        status=scheduler_module.RequestStatus.WAITING,
+    )
+    scheduler.current_step = 12
+    scheduler.deferred_frees = deque([(10, [object(), object()])])
+    scheduler.finished_req_ids = {"finished-req"}
+    scheduler.max_model_len = 32768
+    scheduler.max_num_running_reqs = 16
+    scheduler.max_num_scheduled_tokens = 1024
+    scheduler.requests = {
+        running_req.request_id: running_req,
+        waiting_req.request_id: waiting_req,
+    }
+    scheduler.num_waiting_for_streaming_input = 1
+    scheduler._pause_state = scheduler_module.PauseState.UNPAUSED
+    scheduler.policy = scheduler_module.SchedulingPolicy.FCFS
+    scheduler.prefill_capacity_bound = True
+    scheduler.processed_step_seq = 9
+    scheduler.running = [running_req]
+    scheduler.waiting = [waiting_req]
+    scheduler.skipped_waiting = []
+    scheduler.kv_cache_manager = SimpleNamespace(
+        usage=0.25,
+        num_kv_cache_groups=2,
+        watermark_blocks=3,
+        block_pool=SimpleNamespace(
+            num_gpu_blocks=11,
+            get_num_free_blocks=lambda: 6,
+        ),
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(
+        cache_size=10,
+        num_free_slots=6,
+        num_freeable_slots=7,
+        cached={"hash": {"running-req"}},
+        freeable={"old-hash": 1},
+        freed=["freed-hash"],
+    )
+    scheduler.connector = SimpleNamespace(has_pending_push_work=lambda: True)
+    scheduler.ec_connector = object()
+    scheduler.finished_recving_kv_req_ids = {"loaded-req"}
+    scheduler.failed_recving_kv_req_ids = {"failed-req"}
+    scheduler.defer_block_free = True
+    monkeypatch.setattr(
+        scheduler_module,
+        "time",
+        SimpleNamespace(time=lambda: 1000.0),
+    )
+
+    snapshot = scheduler_module.Scheduler.make_diagnostic_snapshot(scheduler)
+
+    assert snapshot["scheduler"]["current_step"] == 12
+    assert snapshot["scheduler"]["deferred_free_blocks"] == 2
+    assert snapshot["requests"]["running"]["requests"][0]["request_id"] == (
+        "running-req"
+    )
+    assert snapshot["requests"]["running"]["requests"][0]["age_s"] == 10.0
+    assert snapshot["requests"]["waiting"]["oldest_sampled_request_id"] == (
+        "waiting-req"
+    )
+    assert snapshot["kv_cache"] == {
+        "num_allocatable_blocks": 10,
+        "num_free_blocks": 6,
+        "num_gpu_blocks": 11,
+        "num_kv_cache_groups": 2,
+        "num_used_blocks": 4,
+        "usage": 0.25,
+        "watermark_blocks": 3,
+    }
+    assert snapshot["encoder_cache"]["num_cached_entries"] == 1
+    assert snapshot["connectors"]["kv_connector_pending_push_work"]
+
+
+def test_make_scheduler_diagnostic_snapshot_returns_none_on_failure():
+    def raise_snapshot_error():
+        raise RuntimeError("snapshot failed")
+
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(make_diagnostic_snapshot=raise_snapshot_error)
+    )
+
+    assert EngineCore.make_scheduler_diagnostic_snapshot(engine) is None
 
 
 def test_capture_iteration_details_disabled_without_log_stats():
@@ -566,6 +692,7 @@ def test_engine_execution_timeout_watchdog_disarm_suppresses_dump(monkeypatch):
 def test_engine_execution_timeout_real_timeout_emits_useful_summary(monkeypatch):
     logs = []
     traceback_dumped = threading.Event()
+    scheduler_snapshot = {"schema_version": 1, "kv_cache": {"usage": 0.5}}
 
     def record_log(message, *args):
         logs.append(message % args)
@@ -579,6 +706,7 @@ def test_engine_execution_timeout_real_timeout_emits_useful_summary(monkeypatch)
     watchdog = dump_input.EngineExecutionTimeoutWatchdog(
         config=make_timeout_config(),
         timeout_s=0.01,
+        scheduler_snapshot_fn=lambda: scheduler_snapshot,
     )
     watchdog.start()
 
@@ -603,6 +731,7 @@ def test_engine_execution_timeout_real_timeout_emits_useful_summary(monkeypatch)
     assert "request-456" in combined_logs
     assert "temperature" in combined_logs
     assert "num_running_reqs" in combined_logs
+    assert '"schema_version":1' in combined_logs
     assert "private-stop-string" not in combined_logs
     assert "private/model/path" not in combined_logs
 
@@ -641,14 +770,31 @@ def test_log_error_detail_forwards_and_reraises_original_error(monkeypatch):
     config = object()
     scheduler_output = object()
     scheduler_stats = object()
+    scheduler_snapshot = {"requests": {"running": {"count": 1}}}
     engine = SimpleNamespace(
         vllm_config=config,
         scheduler=SimpleNamespace(make_stats=lambda: scheduler_stats),
+        make_scheduler_diagnostic_snapshot=lambda: scheduler_snapshot,
     )
     calls = []
 
-    def record_dump(actual_config, actual_output, actual_stats, *, error):
-        calls.append((actual_config, actual_output, actual_stats, error))
+    def record_dump(
+        actual_config,
+        actual_output,
+        actual_stats,
+        *,
+        error,
+        scheduler_snapshot,
+    ):
+        calls.append(
+            (
+                actual_config,
+                actual_output,
+                actual_stats,
+                error,
+                scheduler_snapshot,
+            )
+        )
 
     monkeypatch.setattr(engine_core_module, "dump_engine_exception", record_dump)
     error = RuntimeError("execute failed")
@@ -660,7 +806,9 @@ def test_log_error_detail_forwards_and_reraises_original_error(monkeypatch):
         raise error
 
     assert caught.value is error
-    assert calls == [(config, scheduler_output, scheduler_stats, error)]
+    assert calls == [
+        (config, scheduler_output, scheduler_stats, error, scheduler_snapshot)
+    ]
 
 
 def test_engine_execution_context_writes_diagnostic_bundle(tmp_path, monkeypatch):
@@ -674,6 +822,7 @@ def test_engine_execution_context_writes_diagnostic_bundle(tmp_path, monkeypatch
         scheduler_output=scheduler_output,
         scheduler_stats=scheduler_stats,
         error=error,
+        scheduler_snapshot={"kv_cache": {"usage": 0.5}},
     )
 
     assert bundle_dir is not None
@@ -688,15 +837,23 @@ def test_engine_execution_context_writes_diagnostic_bundle(tmp_path, monkeypatch
     assert context["timeout_s"] is None
     assert context["scheduler_output_summary"] is None
     assert context["scheduler_queue_summary"] is None
+    assert context["scheduler_snapshot_file"] == "scheduler_snapshot.json"
     assert "req-1" in context["scheduler_output_text"]
     assert "num_running_reqs=1" in context["scheduler_stats_text"]
     assert context["exception"]["type"] == "builtins.RuntimeError"
     assert context["exception"]["message"] == "model execution failed"
+    scheduler_snapshot = json.loads(
+        (bundle_dir / "scheduler_snapshot.json").read_text(encoding="utf-8")
+    )
+    assert scheduler_snapshot == {"kv_cache": {"usage": 0.5}}
     assert json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8")) == {
-        "artifacts": {"context.json": "written"},
+        "artifacts": {
+            "context.json": "written",
+            "scheduler_snapshot.json": "written",
+        },
         "bundle_version": dump_input.ENGINE_DIAGNOSTIC_BUNDLE_VERSION,
         "complete": True,
-        "files": ["context.json"],
+        "files": ["context.json", "scheduler_snapshot.json"],
     }
     if os.name != "nt":
         assert stat.S_IMODE(bundle_dir.parent.parent.stat().st_mode) == 0o700
@@ -704,6 +861,10 @@ def test_engine_execution_context_writes_diagnostic_bundle(tmp_path, monkeypatch
         assert stat.S_IMODE(bundle_dir.stat().st_mode) == 0o700
         assert stat.S_IMODE((bundle_dir / "context.json").stat().st_mode) == 0o600
         assert stat.S_IMODE((bundle_dir / "manifest.json").stat().st_mode) == 0o600
+        assert (
+            stat.S_IMODE((bundle_dir / "scheduler_snapshot.json").stat().st_mode)
+            == 0o600
+        )
 
 
 def test_engine_execution_context_ignores_compilation_debug_dump_path(
@@ -759,6 +920,7 @@ def test_engine_execution_timeout_writes_stack_bundle(tmp_path, monkeypatch):
         == "req-2"
     )
     assert context["scheduler_queue_summary"]["num_waiting_reqs"] == 2
+    assert context["scheduler_snapshot_file"] is None
     assert context["exception"] is None
     manifest = json.loads((bundles[0] / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["complete"] is True

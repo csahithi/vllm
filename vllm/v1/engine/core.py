@@ -273,6 +273,7 @@ class EngineCore:
         self.execution_timeout_watchdog = EngineExecutionTimeoutWatchdog(
             config=self.vllm_config,
             timeout_s=envs.VLLM_ENGINE_SLOW_STAGE_DUMP_S,
+            scheduler_snapshot_fn=self.make_scheduler_diagnostic_snapshot,
         )
         self._timeout_sampling_params_by_request: dict[str, dict[str, Any] | None] = {}
         self.execution_timeout_watchdog.start()
@@ -552,8 +553,16 @@ class EngineCore:
                 scheduler_output,
                 self.scheduler.make_stats(),
                 error=err,
+                scheduler_snapshot=self.make_scheduler_diagnostic_snapshot(),
             )
             raise err
+
+    def make_scheduler_diagnostic_snapshot(self) -> dict[str, Any] | None:
+        try:
+            return self.scheduler.make_diagnostic_snapshot()
+        except Exception:
+            logger.exception("Failed to collect V1 scheduler diagnostic snapshot")
+            return None
 
     @contextmanager
     def dump_on_slow_execution(
