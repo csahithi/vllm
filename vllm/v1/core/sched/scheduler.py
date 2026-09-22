@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sized
 from dataclasses import replace
 from typing import Any
 
@@ -39,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.diagnostics import make_request_id_summary
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -75,6 +76,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+DIAGNOSTIC_REQUEST_SAMPLE_LIMIT = 20
 
 
 class Scheduler(SchedulerInterface):
@@ -2766,6 +2769,204 @@ class Scheduler(SchedulerInterface):
         stale vision embeddings are not reused.
         """
         self.encoder_cache_manager.reset()
+
+    def make_diagnostic_snapshot(self) -> dict[str, Any]:
+        now_s = time.time()
+        return {
+            "schema_version": 1,
+            "scheduler": self._capture_diagnostic_snapshot_section(
+                "scheduler", self._make_scheduler_diagnostic_snapshot
+            ),
+            "requests": {
+                "running": self._capture_diagnostic_snapshot_section(
+                    "requests.running",
+                    lambda: self._make_requests_diagnostic_snapshot(
+                        self.running, now_s
+                    ),
+                ),
+                "waiting": self._capture_diagnostic_snapshot_section(
+                    "requests.waiting",
+                    lambda: self._make_requests_diagnostic_snapshot(
+                        self.waiting, now_s
+                    ),
+                ),
+                "skipped_waiting": self._capture_diagnostic_snapshot_section(
+                    "requests.skipped_waiting",
+                    lambda: self._make_requests_diagnostic_snapshot(
+                        self.skipped_waiting, now_s
+                    ),
+                ),
+            },
+            "kv_cache": self._capture_diagnostic_snapshot_section(
+                "kv_cache", self._make_kv_cache_diagnostic_snapshot
+            ),
+            "encoder_cache": self._capture_diagnostic_snapshot_section(
+                "encoder_cache", self._make_encoder_cache_diagnostic_snapshot
+            ),
+            "connectors": self._capture_diagnostic_snapshot_section(
+                "connectors", self._make_connector_diagnostic_snapshot
+            ),
+        }
+
+    @staticmethod
+    def _capture_diagnostic_snapshot_section(
+        section: str,
+        make_snapshot: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            return make_snapshot()
+        except Exception:
+            logger.exception(
+                "Failed to collect scheduler diagnostic snapshot section '%s'",
+                section,
+            )
+            return {"error": "snapshot_unavailable"}
+
+    def _make_scheduler_diagnostic_snapshot(self) -> dict[str, Any]:
+        return {
+            "current_step": self.current_step,
+            "deferred_free_fences": len(self.deferred_frees),
+            "deferred_free_blocks": sum(
+                len(blocks) for _, blocks in self.deferred_frees
+            ),
+            "finished_req_ids": len(self.finished_req_ids),
+            "max_model_len": self.max_model_len,
+            "max_num_running_reqs": self.max_num_running_reqs,
+            "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+            "num_known_reqs": len(self.requests),
+            "num_waiting_for_streaming_input": self.num_waiting_for_streaming_input,
+            "pause_state": self._pause_state.name,
+            "policy": self.policy.value,
+            "prefill_capacity_bound": self.prefill_capacity_bound,
+            "processed_step_seq": self.processed_step_seq,
+        }
+
+    def _make_requests_diagnostic_snapshot(
+        self,
+        requests: Iterable[Request],
+        now_s: float,
+    ) -> dict[str, Any]:
+        request_count = len(requests) if isinstance(requests, Sized) else None
+        if isinstance(requests, RequestQueue):
+            sampled_requests = requests.get_request_samples(
+                DIAGNOSTIC_REQUEST_SAMPLE_LIMIT
+            )
+        else:
+            sampled_requests = itertools.islice(
+                requests, DIAGNOSTIC_REQUEST_SAMPLE_LIMIT
+            )
+        request_samples = [
+            self._make_request_diagnostic_snapshot(request, now_s)
+            for request in sampled_requests
+        ]
+        sampled_ages_s = [
+            sample["age_s"]
+            for sample in request_samples
+            if isinstance(sample["age_s"], float)
+        ]
+        oldest_sample = max(
+            request_samples,
+            key=lambda sample: sample["age_s"] if sample["age_s"] is not None else -1.0,
+            default=None,
+        )
+
+        return {
+            "count": request_count,
+            "oldest_sampled_age_s": max(sampled_ages_s, default=None),
+            "oldest_sampled_request_id": (
+                oldest_sample["request_id"] if oldest_sample else None
+            ),
+            "sample_limit": DIAGNOSTIC_REQUEST_SAMPLE_LIMIT,
+            "sampled_count": len(request_samples),
+            "requests": request_samples,
+            "truncated": (
+                request_count is not None
+                and request_count > DIAGNOSTIC_REQUEST_SAMPLE_LIMIT
+            ),
+        }
+
+    def _make_request_diagnostic_snapshot(
+        self,
+        request: Request,
+        now_s: float,
+    ) -> dict[str, Any]:
+        arrival_time = getattr(request, "arrival_time", None)
+        age_s = (
+            round(max(0.0, now_s - arrival_time), 3)
+            if isinstance(arrival_time, (int, float))
+            else None
+        )
+        status = getattr(request, "status", None)
+        status_name = status.name if hasattr(status, "name") else str(status)
+
+        return {
+            "age_s": age_s,
+            "has_ec_transfer_params": request.ec_transfer_params is not None,
+            "has_kv_transfer_params": request.kv_transfer_params is not None,
+            "has_lora": request.lora_request is not None,
+            "has_pooling_params": request.pooling_params is not None,
+            "has_sampling_params": request.sampling_params is not None,
+            "is_prefill_chunk": request.is_prefill_chunk,
+            "max_tokens": request.max_tokens,
+            "num_computed_tokens": request.num_computed_tokens,
+            "num_encoder_inputs": request.num_encoder_inputs,
+            "num_in_flight_tokens": request.num_in_flight_tokens,
+            "num_output_tokens": request.num_output_tokens,
+            "num_preemptions": request.num_preemptions,
+            "num_prompt_tokens": request.num_prompt_tokens,
+            "num_spec_tokens": len(request.spec_token_ids),
+            "num_tokens": request.num_tokens,
+            "priority": request.priority,
+            **make_request_id_summary(request.request_id),
+            "status": status_name,
+            "use_structured_output": request.use_structured_output,
+        }
+
+    def _make_kv_cache_diagnostic_snapshot(self) -> dict[str, Any]:
+        block_pool = self.kv_cache_manager.block_pool
+        num_free_blocks = block_pool.get_num_free_blocks()
+        # BlockPool permanently reserves one GPU block as its null block.
+        num_allocatable_blocks = block_pool.num_gpu_blocks - 1
+        return {
+            "num_allocatable_blocks": num_allocatable_blocks,
+            "num_free_blocks": num_free_blocks,
+            "num_gpu_blocks": block_pool.num_gpu_blocks,
+            "num_kv_cache_groups": self.kv_cache_manager.num_kv_cache_groups,
+            "num_used_blocks": num_allocatable_blocks - num_free_blocks,
+            "usage": self.kv_cache_manager.usage,
+            "watermark_blocks": self.kv_cache_manager.watermark_blocks,
+        }
+
+    def _make_encoder_cache_diagnostic_snapshot(self) -> dict[str, Any]:
+        manager = self.encoder_cache_manager
+        cached = getattr(manager, "cached", None)
+        freeable = getattr(manager, "freeable", None)
+        freed = getattr(manager, "freed", None)
+        return {
+            "cache_size": getattr(manager, "cache_size", None),
+            "num_cached_entries": len(cached) if cached is not None else None,
+            "num_free_slots": getattr(manager, "num_free_slots", None),
+            "num_freeable_entries": len(freeable) if freeable is not None else None,
+            "num_freeable_slots": getattr(manager, "num_freeable_slots", None),
+            "num_pending_freed_hashes": len(freed) if freed is not None else None,
+        }
+
+    def _make_connector_diagnostic_snapshot(self) -> dict[str, Any]:
+        pending_push_work = None
+        if self.connector is not None:
+            try:
+                pending_push_work = self.connector.has_pending_push_work()
+            except Exception:
+                pending_push_work = None
+
+        return {
+            "ec_connector_enabled": self.ec_connector is not None,
+            "finished_recving_kv_reqs": len(self.finished_recving_kv_req_ids),
+            "failed_recving_kv_reqs": len(self.failed_recving_kv_req_ids),
+            "kv_connector_enabled": self.connector is not None,
+            "kv_connector_pending_push_work": pending_push_work,
+            "kv_connector_defer_block_free": self.defer_block_free,
+        }
 
     def make_stats(
         self,

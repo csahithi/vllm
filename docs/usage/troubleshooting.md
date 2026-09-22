@@ -39,16 +39,18 @@ If other strategies don't solve the problem, it's likely that the vLLM instance 
 - `export VLLM_ENGINE_SLOW_STAGE_DUMP_S=60` to dump bounded, sanitized scheduler
   state and Python stack traces when a V1 model-execution stage exceeds the
   timeout. It defaults to `0` (disabled), adds runtime overhead while enabled,
-  throttles repeated dumps, and omits prompt and token values. Stack traces can
-  contain source file paths. The watchdog requires a Python thread to run and
-  cannot report native-code stalls that hold the Python GIL indefinitely.
+  throttles repeated dumps, and omits prompt and token values. Bounded request
+  identifiers may appear in diagnostic logs, and stack traces can contain
+  source file paths. The watchdog requires a Python thread to run and cannot
+  report native-code stalls that hold the Python GIL indefinitely.
 - `export VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH=/local/path` to persist private,
   per-rank diagnostic bundles for engine exceptions and slow-stage timeouts.
-  Use fast local storage: exception-path writes wait at most one second, bundles
-  may contain sensitive request, configuration, exception, and source-path
-  data, and only the newest 20 finalized bundles per rank are retained. Timeout
-  persistence uses one background writer per engine watchdog so filesystem
-  stalls cannot block later stderr diagnostics.
+  Bundles include engine context, bounded scheduler/request/KV-cache snapshots,
+  and timeout stack traces. Use fast local storage: exception-path writes wait
+  at most one second, bundles may contain sensitive request, configuration,
+  exception, and source-path data, and only the newest 20 finalized bundles per
+  rank are retained. Timeout persistence uses one background writer per engine
+  watchdog so filesystem stalls cannot block later stderr diagnostics.
 - `export CUDA_LAUNCH_BLOCKING=1` to identify which CUDA kernel is causing the problem.
 - `export NCCL_DEBUG=TRACE` to turn on more logging for NCCL.
 - `export VLLM_TRACE_FUNCTION=1` to record all function calls for inspection in the log files to tell which function crashes or hangs. (WARNING: This flag will slow down the token generation by **over 100x**. Do not use unless absolutely needed.)

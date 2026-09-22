@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import heapq
+import itertools
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -70,6 +71,10 @@ class RequestQueue(ABC):
     def __iter__(self) -> Iterator[Request]:
         """Iterate over the queue according to the policy."""
         pass
+
+    def get_request_samples(self, limit: int) -> list[Request]:
+        """Return up to ``limit`` requests without mutating the queue."""
+        return list(itertools.islice(self, limit))
 
 
 class FCFSRequestQueue(deque[Request], RequestQueue):
@@ -195,6 +200,9 @@ class PriorityRequestQueue(RequestQueue):
         heap_copy = self._heap[:]
         while heap_copy:
             yield heapq.heappop(heap_copy)
+
+    def get_request_samples(self, limit: int) -> list[Request]:
+        return heapq.nsmallest(limit, self._heap)
 
 
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
