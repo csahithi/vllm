@@ -7,7 +7,9 @@ import faulthandler
 import hashlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback as traceback_utils
@@ -19,6 +21,7 @@ from typing import Any
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -28,12 +31,21 @@ from vllm.version import __version__ as VLLM_VERSION
 logger = init_logger(__name__)
 
 ENGINE_EXECUTION_TIMEOUT_DUMP_THROTTLE_S = 300.0
-ENGINE_DIAGNOSTIC_BUNDLE_VERSION = 1
+ENGINE_DIAGNOSTIC_BUNDLE_VERSION = 2
 ENGINE_DIAGNOSTIC_DUMP_DIR = "engine_diagnostics"
+ENGINE_DIAGNOSTIC_BUNDLE_PREFIX = "bundle_"
+ENGINE_DIAGNOSTIC_MAX_BUNDLES = 20
+ENGINE_DIAGNOSTIC_INCOMPLETE_MAX_AGE_S = 3600.0
+ENGINE_DIAGNOSTIC_CONTEXT_MAX_BYTES = 1024 * 1024
+ENGINE_DIAGNOSTIC_STACKS_MAX_BYTES = 1024 * 1024
+ENGINE_DIAGNOSTIC_TEXT_MAX_CHARS = 32_768
+ENGINE_DIAGNOSTIC_EXCEPTION_MESSAGE_MAX_CHARS = 4096
+ENGINE_DIAGNOSTIC_WRITE_TIMEOUT_S = 1.0
 ENGINE_EXECUTION_TIMEOUT_REQUEST_SAMPLE_LIMIT = 20
 ENGINE_EXECUTION_TIMEOUT_REQUEST_ID_MAX_CHARS = 256
 ENGINE_EXECUTION_TIMEOUT_SUMMARY_MAX_CHARS = 32_768
 ENGINE_EXECUTION_TIMEOUT_WATCHDOG_STOP_TIMEOUT_S = 1.0
+_engine_diagnostic_bundle_lock = threading.Lock()
 _ENGINE_TIMEOUT_MODEL_CONFIG_FIELDS = (
     "dtype",
     "enforce_eager",
@@ -142,19 +154,10 @@ def dump_engine_execution_timeout(
     timeout_s: float,
     stage: str,
 ):
+    _emit_engine_execution_timeout(stage, timeout_s)
+
     diagnostic_bundle_dir: Path | None = None
     try:
-        logger.error(
-            "V1 LLM engine stage '%s' has not completed after %.2f seconds "
-            "(pid=%d). Dumping sanitized scheduler state and Python stack "
-            "traces. "
-            "Further dumps for this stage are throttled for %.0f seconds. "
-            "Set VLLM_ENGINE_SLOW_STAGE_DUMP_S=0 to disable this diagnostic.",
-            stage,
-            timeout_s,
-            os.getpid(),
-            ENGINE_EXECUTION_TIMEOUT_DUMP_THROTTLE_S,
-        )
         diagnostic_bundle_dir = _dump_engine_timeout_context(
             config,
             snapshot,
@@ -167,6 +170,25 @@ def dump_engine_execution_timeout(
 
     if diagnostic_bundle_dir is not None:
         _write_engine_traceback_dump(diagnostic_bundle_dir)
+        _finalize_engine_diagnostic_bundle(
+            diagnostic_bundle_dir,
+            expected_files=("context.json", "stacks.txt"),
+        )
+
+
+def _emit_engine_execution_timeout(stage: str, timeout_s: float) -> None:
+    with contextlib.suppress(Exception):
+        logger.error(
+            "V1 LLM engine stage '%s' has not completed after %.2f seconds "
+            "(pid=%d). Dumping sanitized scheduler state and Python stack "
+            "traces. "
+            "Further dumps for this stage are throttled for %.0f seconds. "
+            "Set VLLM_ENGINE_SLOW_STAGE_DUMP_S=0 to disable this diagnostic.",
+            stage,
+            timeout_s,
+            os.getpid(),
+            ENGINE_EXECUTION_TIMEOUT_DUMP_THROTTLE_S,
+        )
 
     with contextlib.suppress(Exception):
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
@@ -196,9 +218,11 @@ def _dump_engine_timeout_context(
     return _write_engine_diagnostic_bundle(
         reason="timeout",
         config=config,
-        config_dump=config_summary,
-        scheduler_output_dump=scheduler_output_dump,
-        scheduler_stats_dump=scheduler_queue_dump,
+        config_summary=config_summary,
+        scheduler_output_summary=snapshot.scheduler_output_summary,
+        scheduler_queue_summary=snapshot.scheduler_queue_summary,
+        scheduler_output_text=None,
+        scheduler_stats_text=None,
         stage=stage,
         timeout_s=timeout_s,
         error=None,
@@ -597,30 +621,103 @@ def _dump_engine_execution_context(
     except Exception:
         logger.exception("Error preparing object to dump")
 
-    return _write_engine_diagnostic_bundle(
+    dump_root = _engine_diagnostic_dump_root(config)
+    if dump_root is None:
+        return None
+
+    try:
+        config_summary = _make_engine_config_summary(config)
+    except Exception:
+        logger.exception("Failed to prepare engine diagnostic config summary")
+        config_summary = {"summary_unavailable": True}
+
+    return _write_engine_diagnostic_bundle_with_timeout(
         reason=reason,
         config=config,
-        scheduler_output_dump=scheduler_output_dump,
-        scheduler_stats_dump=scheduler_stats_dump,
+        dump_root=dump_root,
+        config_summary=config_summary,
+        scheduler_output_summary=None,
+        scheduler_queue_summary=None,
+        scheduler_output_text=scheduler_output_dump,
+        scheduler_stats_text=scheduler_stats_dump,
         stage=stage,
         timeout_s=timeout_s,
         error=error,
     )
 
 
+def _write_engine_diagnostic_bundle_with_timeout(
+    *,
+    reason: str,
+    config: VllmConfig,
+    dump_root: Path,
+    config_summary: dict[str, Any],
+    scheduler_output_summary: dict[str, Any] | None,
+    scheduler_queue_summary: dict[str, Any] | None,
+    scheduler_output_text: str | None,
+    scheduler_stats_text: str | None,
+    stage: str | None,
+    timeout_s: float | None,
+    error: Exception | None,
+) -> Path | None:
+    result: list[Path] = []
+
+    def write_bundle() -> None:
+        bundle_dir = _write_engine_diagnostic_bundle(
+            reason=reason,
+            config=config,
+            dump_root=dump_root,
+            config_summary=config_summary,
+            scheduler_output_summary=scheduler_output_summary,
+            scheduler_queue_summary=scheduler_queue_summary,
+            scheduler_output_text=scheduler_output_text,
+            scheduler_stats_text=scheduler_stats_text,
+            stage=stage,
+            timeout_s=timeout_s,
+            error=error,
+        )
+        if bundle_dir is not None and _finalize_engine_diagnostic_bundle(bundle_dir):
+            result.append(bundle_dir)
+
+    writer = threading.Thread(
+        target=write_bundle,
+        name="EngineDiagnosticBundleWriter",
+        daemon=True,
+    )
+    try:
+        writer.start()
+    except RuntimeError:
+        logger.exception("Failed to start V1 LLM engine diagnostic bundle writer")
+        return None
+
+    writer.join(ENGINE_DIAGNOSTIC_WRITE_TIMEOUT_S)
+    if writer.is_alive():
+        logger.warning(
+            "V1 LLM engine diagnostic bundle write did not complete within %.1f "
+            "seconds; continuing exception propagation",
+            ENGINE_DIAGNOSTIC_WRITE_TIMEOUT_S,
+        )
+        return None
+    return result[0] if result else None
+
+
 def _write_engine_diagnostic_bundle(
     *,
     reason: str,
     config: VllmConfig,
-    scheduler_output_dump: str | None,
-    scheduler_stats_dump: str | None,
+    config_summary: dict[str, Any],
+    scheduler_output_summary: dict[str, Any] | None,
+    scheduler_queue_summary: dict[str, Any] | None,
+    scheduler_output_text: str | None,
+    scheduler_stats_text: str | None,
     stage: str | None,
     timeout_s: float | None,
     error: Exception | None,
-    config_dump: Any | None = None,
+    dump_root: Path | None = None,
 ) -> Path | None:
+    bundle_dir: Path | None = None
     try:
-        dump_root = _engine_diagnostic_dump_root(config)
+        dump_root = dump_root or _engine_diagnostic_dump_root(config)
         if dump_root is None:
             return None
 
@@ -629,36 +726,50 @@ def _write_engine_diagnostic_bundle(
         )
         context = {
             "bundle_version": ENGINE_DIAGNOSTIC_BUNDLE_VERSION,
-            "config": str(config) if config_dump is None else config_dump,
+            "config_summary": config_summary,
             "created_at": created_at.isoformat(),
             "exception": _format_engine_diagnostic_exception(error),
             "pid": os.getpid(),
             "reason": reason,
-            "scheduler_output": scheduler_output_dump,
-            "scheduler_stats": scheduler_stats_dump,
+            "scheduler_output_summary": scheduler_output_summary,
+            "scheduler_output_text": _bounded_engine_diagnostic_text(
+                scheduler_output_text
+            ),
+            "scheduler_queue_summary": scheduler_queue_summary,
+            "scheduler_stats_text": _bounded_engine_diagnostic_text(
+                scheduler_stats_text
+            ),
             "stage": stage,
             "timeout_s": timeout_s,
             "vllm_version": VLLM_VERSION,
         }
-        (bundle_dir / "context.json").write_text(
-            json.dumps(context, indent=2, sort_keys=True),
-            encoding="utf-8",
+        _write_engine_diagnostic_json(
+            bundle_dir / "context.json",
+            context,
+            max_bytes=ENGINE_DIAGNOSTIC_CONTEXT_MAX_BYTES,
         )
-        logger.error("Wrote V1 LLM engine diagnostic bundle to %s", bundle_dir)
         return bundle_dir
     except Exception:
         logger.exception("Failed to write V1 LLM engine diagnostic bundle")
+        if bundle_dir is not None:
+            _remove_engine_diagnostic_bundle(bundle_dir)
         return None
 
 
 def _engine_diagnostic_dump_root(config: VllmConfig) -> Path | None:
-    if not hasattr(config, "compile_debug_dump_path"):
+    configured_path = envs.VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH
+    if not configured_path:
         return None
 
-    debug_dump_path = config.compile_debug_dump_path()
-    if debug_dump_path is None:
-        return None
-    return debug_dump_path / ENGINE_DIAGNOSTIC_DUMP_DIR
+    parallel_config = config.parallel_config
+    rank = getattr(parallel_config, "rank", 0)
+    dp_index = getattr(parallel_config, "data_parallel_index", 0)
+    rank_dir = f"rank_{rank}_dp_{dp_index}"
+    return (
+        Path(configured_path).expanduser().absolute()
+        / rank_dir
+        / ENGINE_DIAGNOSTIC_DUMP_DIR
+    )
 
 
 def _create_engine_diagnostic_bundle_dir(
@@ -670,15 +781,27 @@ def _create_engine_diagnostic_bundle_dir(
     timestamp = created_at.strftime("%Y%m%dT%H%M%S.%fZ")
     reason_part = _safe_diagnostic_filename_component(reason)
     stage_part = _safe_diagnostic_filename_component(stage)
-    base_name = f"{timestamp}_pid{os.getpid()}_{reason_part}_{stage_part}"
+    base_name = (
+        f"{ENGINE_DIAGNOSTIC_BUNDLE_PREFIX}{timestamp}_pid{os.getpid()}_"
+        f"{reason_part}_{stage_part}"
+    )
 
-    for suffix in range(1000):
-        bundle_dir = dump_root / (base_name if suffix == 0 else f"{base_name}_{suffix}")
-        try:
-            bundle_dir.mkdir(parents=True, exist_ok=False)
-            return bundle_dir, created_at
-        except FileExistsError:
-            continue
+    with _engine_diagnostic_bundle_lock:
+        dump_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(dump_root.parent, 0o700)
+        dump_root.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(dump_root, 0o700)
+        _prune_engine_diagnostic_bundles_locked(dump_root)
+        for suffix in range(1000):
+            bundle_dir = dump_root / (
+                base_name if suffix == 0 else f"{base_name}_{suffix}"
+            )
+            try:
+                bundle_dir.mkdir(mode=0o700, exist_ok=False)
+                os.chmod(bundle_dir, 0o700)
+                return bundle_dir, created_at
+            except FileExistsError:
+                continue
 
     raise FileExistsError(f"Could not create unique diagnostic bundle in {dump_root}")
 
@@ -698,21 +821,210 @@ def _format_engine_diagnostic_exception(
 ) -> dict[str, str] | None:
     if error is None:
         return None
-    return {
-        "message": str(error),
-        "traceback": "".join(
+    message = _bounded_engine_diagnostic_text(
+        str(error), max_chars=ENGINE_DIAGNOSTIC_EXCEPTION_MESSAGE_MAX_CHARS
+    )
+    traceback = _bounded_engine_diagnostic_text(
+        "".join(
             traceback_utils.format_exception(type(error), error, error.__traceback__)
-        ),
+        )
+    )
+    return {
+        "message": message or "",
+        "traceback": traceback or "",
         "type": f"{type(error).__module__}.{type(error).__qualname__}",
     }
 
 
-def _write_engine_traceback_dump(bundle_dir: Path) -> None:
+def _bounded_engine_diagnostic_text(
+    value: str | None,
+    *,
+    max_chars: int = ENGINE_DIAGNOSTIC_TEXT_MAX_CHARS,
+) -> str | None:
+    if value is None or len(value) <= max_chars:
+        return value
+
+    digest = hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
+    marker = f"\n...[truncated length={len(value)}, sha256={digest}]"
+    return value[: max(0, max_chars - len(marker))] + marker
+
+
+def _write_private_text_atomic(
+    path: Path,
+    value: str,
+    *,
+    max_bytes: int,
+) -> None:
+    encoded = value.encode("utf-8", errors="surrogatepass")
+    if len(encoded) > max_bytes:
+        raise ValueError(f"Diagnostic output exceeds {max_bytes} bytes")
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
     try:
-        with (bundle_dir / "stacks.txt").open("w", encoding="utf-8") as dump_file:
-            faulthandler.dump_traceback(file=dump_file, all_threads=True)
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(fd, "wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+        os.chmod(path, 0o600)
     except Exception:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            temporary_path.unlink()
+        raise
+
+
+def _write_engine_diagnostic_json(
+    path: Path,
+    value: dict[str, Any],
+    *,
+    max_bytes: int,
+) -> None:
+    serialized = json.dumps(value, indent=2, sort_keys=True, default=str)
+    _write_private_text_atomic(path, serialized, max_bytes=max_bytes)
+
+
+def _write_engine_traceback_dump(bundle_dir: Path) -> bool:
+    stack_path = bundle_dir / "stacks.txt"
+    fd: int | None = None
+    temporary_path: Path | None = None
+    try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=".stacks.txt.", suffix=".tmp", dir=bundle_dir
+        )
+        temporary_path = Path(temporary_name)
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(fd, "w+b") as dump_file:
+            fd = None
+            faulthandler.dump_traceback(file=dump_file, all_threads=True)
+            dump_file.flush()
+            size = os.fstat(dump_file.fileno()).st_size
+            if size > ENGINE_DIAGNOSTIC_STACKS_MAX_BYTES:
+                marker = b"\n...[stack dump truncated]\n"
+                dump_file.seek(ENGINE_DIAGNOSTIC_STACKS_MAX_BYTES - len(marker))
+                dump_file.write(marker)
+                dump_file.truncate(ENGINE_DIAGNOSTIC_STACKS_MAX_BYTES)
+            os.fsync(dump_file.fileno())
+        os.replace(temporary_path, stack_path)
+        os.chmod(stack_path, 0o600)
+        return True
+    except Exception:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if temporary_path is not None:
+            with contextlib.suppress(OSError):
+                temporary_path.unlink()
         logger.exception("Failed to write V1 LLM engine stack trace dump")
+        return False
+
+
+def _finalize_engine_diagnostic_bundle(
+    bundle_dir: Path,
+    *,
+    expected_files: tuple[str, ...] = ("context.json",),
+) -> bool:
+    try:
+        files = sorted(
+            path.name
+            for path in bundle_dir.iterdir()
+            if path.is_file() and path.name != "manifest.json"
+        )
+        artifacts = {
+            name: "written" if name in files else "failed" for name in expected_files
+        }
+        complete = all(status == "written" for status in artifacts.values())
+        _write_engine_diagnostic_json(
+            bundle_dir / "manifest.json",
+            {
+                "artifacts": artifacts,
+                "bundle_version": ENGINE_DIAGNOSTIC_BUNDLE_VERSION,
+                "complete": complete,
+                "files": files,
+            },
+            max_bytes=ENGINE_DIAGNOSTIC_CONTEXT_MAX_BYTES,
+        )
+    except Exception:
+        logger.exception("Failed to finalize V1 LLM engine diagnostic bundle")
+        _remove_engine_diagnostic_bundle(bundle_dir)
+        return False
+
+    if complete:
+        logger.error("Wrote V1 LLM engine diagnostic bundle to %s", bundle_dir)
+    else:
+        logger.warning(
+            "Wrote incomplete V1 LLM engine diagnostic bundle to %s: %s",
+            bundle_dir,
+            artifacts,
+        )
+    try:
+        _prune_engine_diagnostic_bundles(bundle_dir.parent)
+    except OSError:
+        logger.warning(
+            "Failed to prune old V1 LLM engine diagnostic bundles in %s",
+            bundle_dir.parent,
+            exc_info=True,
+        )
+    return True
+
+
+def _remove_engine_diagnostic_bundle(bundle_dir: Path) -> None:
+    try:
+        shutil.rmtree(bundle_dir)
+    except OSError:
+        logger.warning(
+            "Failed to remove incomplete V1 LLM engine diagnostic bundle %s",
+            bundle_dir,
+            exc_info=True,
+        )
+
+
+def _prune_engine_diagnostic_bundles(dump_root: Path) -> None:
+    with _engine_diagnostic_bundle_lock:
+        _prune_engine_diagnostic_bundles_locked(dump_root)
+
+
+def _prune_engine_diagnostic_bundles_locked(dump_root: Path) -> None:
+    now = time.time()
+    bundle_dirs = sorted(
+        (
+            path
+            for path in dump_root.iterdir()
+            if path.is_dir()
+            and not path.is_symlink()
+            and path.name.startswith(ENGINE_DIAGNOSTIC_BUNDLE_PREFIX)
+        ),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    finalized_dirs = [
+        path for path in bundle_dirs if (path / "manifest.json").is_file()
+    ]
+    finalized_dir_set = set(finalized_dirs)
+    stale_incomplete_dirs = []
+    for path in bundle_dirs:
+        if path in finalized_dir_set:
+            continue
+        try:
+            if now - path.stat().st_mtime > ENGINE_DIAGNOSTIC_INCOMPLETE_MAX_AGE_S:
+                stale_incomplete_dirs.append(path)
+        except OSError:
+            continue
+
+    for path in finalized_dirs[ENGINE_DIAGNOSTIC_MAX_BUNDLES:] + stale_incomplete_dirs:
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            logger.warning(
+                "Failed to remove old V1 LLM engine diagnostic bundle %s",
+                path,
+                exc_info=True,
+            )
 
 
 @dataclass(frozen=True)
@@ -742,6 +1054,7 @@ class EngineExecutionTimeoutWatchdog:
         self._lock = threading.Lock()
         self._state: _EngineExecutionTimeoutState | None = None
         self._stopped = False
+        self._diagnostic_thread: threading.Thread | None = None
         self._thread: threading.Thread | None = None
         self._wake_event = threading.Event()
 
@@ -791,8 +1104,9 @@ class EngineExecutionTimeoutWatchdog:
             thread.join(timeout=ENGINE_EXECUTION_TIMEOUT_WATCHDOG_STOP_TIMEOUT_S)
             if thread.is_alive():
                 logger.warning(
-                    "Engine execution timeout watchdog is still finishing "
-                    "diagnostic output after shutdown"
+                    "Engine execution timeout watchdog did not stop within "
+                    "%.1f seconds",
+                    ENGINE_EXECUTION_TIMEOUT_WATCHDOG_STOP_TIMEOUT_S,
                 )
 
     def arm(
@@ -863,12 +1177,61 @@ class EngineExecutionTimeoutWatchdog:
 
             if not self._mark_dump_if_allowed(state.stage):
                 continue
-            dump_engine_execution_timeout(
-                self.config,
-                state.snapshot,
-                self.timeout_s or 0,
+            self._dispatch_timeout_dump(state)
+
+    def _dispatch_timeout_dump(self, state: _EngineExecutionTimeoutState) -> bool:
+        timeout_s = self.timeout_s or 0
+        creation_error: Exception | None = None
+        with self._lock:
+            diagnostic_thread = self._diagnostic_thread
+            if diagnostic_thread is not None and diagnostic_thread.is_alive():
+                write_in_flight = True
+                next_thread = None
+            else:
+                write_in_flight = False
+                try:
+                    next_thread = threading.Thread(
+                        target=dump_engine_execution_timeout,
+                        args=(self.config, state.snapshot, timeout_s, state.stage),
+                        name="EngineExecutionTimeoutDiagnostic",
+                        daemon=True,
+                    )
+                    self._diagnostic_thread = next_thread
+                except Exception as err:
+                    creation_error = err
+                    next_thread = None
+
+        if write_in_flight:
+            _emit_engine_execution_timeout(state.stage, timeout_s)
+            logger.warning(
+                "Skipping file-backed timeout diagnostics for stage '%s' because "
+                "a previous diagnostic write is still in progress",
                 state.stage,
             )
+            return False
+
+        if next_thread is None:
+            _emit_engine_execution_timeout(state.stage, timeout_s)
+            logger.warning(
+                "Unable to create the engine timeout diagnostic writer; "
+                "continuing without file-backed output: %s",
+                creation_error,
+            )
+            return False
+        try:
+            next_thread.start()
+        except RuntimeError as err:
+            with self._lock:
+                if self._diagnostic_thread is next_thread:
+                    self._diagnostic_thread = None
+            _emit_engine_execution_timeout(state.stage, timeout_s)
+            logger.warning(
+                "Unable to start the engine timeout diagnostic writer; "
+                "continuing without file-backed output: %s",
+                err,
+            )
+            return False
+        return True
 
     def _mark_dump_if_allowed(self, stage: str) -> bool:
         now_s = self.time_fn()
