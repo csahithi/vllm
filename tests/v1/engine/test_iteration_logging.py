@@ -806,6 +806,33 @@ def test_engine_execution_timeout_stack_failure_is_fail_open(tmp_path, monkeypat
     assert manifest["files"] == ["context.json"]
 
 
+def test_engine_diagnostic_atomic_replace_failure_does_not_close_owned_fd(
+    tmp_path, monkeypatch
+):
+    close_calls = []
+    real_close = os.close
+
+    def record_close(fd):
+        close_calls.append(fd)
+        real_close(fd)
+
+    def fail_replace(*args):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(dump_input.os, "close", record_close)
+    monkeypatch.setattr(dump_input.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="read-only filesystem"):
+        dump_input._write_private_text_atomic(
+            tmp_path / "context.json",
+            "{}",
+            max_bytes=dump_input.ENGINE_DIAGNOSTIC_CONTEXT_MAX_BYTES,
+        )
+
+    assert close_calls == []
+    assert not list(tmp_path.iterdir())
+
+
 def test_engine_diagnostic_bundle_retention_is_bounded(tmp_path, monkeypatch):
     config = enable_engine_diagnostic_bundles(monkeypatch, tmp_path)
     monkeypatch.setattr(dump_input, "ENGINE_DIAGNOSTIC_MAX_BUNDLES", 2)

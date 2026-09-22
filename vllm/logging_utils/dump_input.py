@@ -859,6 +859,7 @@ def _write_private_text_atomic(
     if len(encoded) > max_bytes:
         raise ValueError(f"Diagnostic output exceeds {max_bytes} bytes")
 
+    fd: int | None
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -866,14 +867,16 @@ def _write_private_text_atomic(
     try:
         os.chmod(temporary_path, 0o600)
         with os.fdopen(fd, "wb") as output:
+            fd = None
             output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary_path, path)
         os.chmod(path, 0o600)
     except Exception:
-        with contextlib.suppress(OSError):
-            os.close(fd)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         with contextlib.suppress(OSError):
             temporary_path.unlink()
         raise
@@ -909,6 +912,7 @@ def _write_engine_traceback_dump(bundle_dir: Path) -> bool:
                 dump_file.seek(ENGINE_DIAGNOSTIC_STACKS_MAX_BYTES - len(marker))
                 dump_file.write(marker)
                 dump_file.truncate(ENGINE_DIAGNOSTIC_STACKS_MAX_BYTES)
+                dump_file.flush()
             os.fsync(dump_file.fileno())
         os.replace(temporary_path, stack_path)
         os.chmod(stack_path, 0o600)
