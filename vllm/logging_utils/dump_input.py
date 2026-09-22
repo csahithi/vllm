@@ -24,6 +24,10 @@ import torch
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.core.sched.diagnostics import (
+    DIAGNOSTIC_STRING_MAX_CHARS,
+    make_request_id_summary,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.version import __version__ as VLLM_VERSION
@@ -42,7 +46,6 @@ ENGINE_DIAGNOSTIC_TEXT_MAX_CHARS = 32_768
 ENGINE_DIAGNOSTIC_EXCEPTION_MESSAGE_MAX_CHARS = 4096
 ENGINE_DIAGNOSTIC_WRITE_TIMEOUT_S = 1.0
 ENGINE_EXECUTION_TIMEOUT_REQUEST_SAMPLE_LIMIT = 20
-ENGINE_EXECUTION_TIMEOUT_REQUEST_ID_MAX_CHARS = 256
 ENGINE_EXECUTION_TIMEOUT_SUMMARY_MAX_CHARS = 32_768
 ENGINE_EXECUTION_TIMEOUT_WATCHDOG_STOP_TIMEOUT_S = 1.0
 _engine_diagnostic_bundle_lock = threading.Lock()
@@ -378,7 +381,7 @@ def _diagnostic_scalar(value: Any) -> Any:
 
 
 def _bounded_diagnostic_string(value: str) -> str:
-    if len(value) <= ENGINE_EXECUTION_TIMEOUT_REQUEST_ID_MAX_CHARS:
+    if len(value) <= DIAGNOSTIC_STRING_MAX_CHARS:
         return value
     digest = hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
     return f"{value[:160]}...{value[-64:]} [length={len(value)}, sha256={digest}]"
@@ -520,21 +523,6 @@ def _make_cached_request_sample(
         "request_kind": "cached",
         "sampling_params": (cached_sampling_params or {}).get(request_id),
         **_make_scheduled_request_summary(request_id, scheduler_output),
-    }
-
-
-def make_request_id_summary(request_id: str) -> dict[str, Any]:
-    if len(request_id) <= ENGINE_EXECUTION_TIMEOUT_REQUEST_ID_MAX_CHARS:
-        return {"request_id": request_id}
-
-    digest = hashlib.sha256(
-        request_id.encode("utf-8", errors="surrogatepass")
-    ).hexdigest()
-    return {
-        "request_id": f"{request_id[:160]}...{request_id[-64:]}",
-        "request_id_length": len(request_id),
-        "request_id_sha256": digest,
-        "request_id_truncated": True,
     }
 
 

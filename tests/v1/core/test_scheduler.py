@@ -87,6 +87,37 @@ def test_scheduler_diagnostic_snapshot_bounds_priority_request_samples():
     assert snapshot["encoder_cache"]["num_cached_entries"] == 0
 
 
+def test_scheduler_diagnostic_snapshot_preserves_healthy_sections(monkeypatch):
+    scheduler = create_scheduler()
+    monkeypatch.setattr(
+        scheduler,
+        "_make_kv_cache_diagnostic_snapshot",
+        Mock(side_effect=RuntimeError("kv cache snapshot failed")),
+    )
+
+    snapshot = scheduler.make_diagnostic_snapshot()
+
+    assert snapshot["kv_cache"] == {"error": "snapshot_unavailable"}
+    assert snapshot["scheduler"]["current_step"] == 0
+    assert snapshot["requests"]["running"]["count"] == 0
+    assert snapshot["encoder_cache"]["num_cached_entries"] == 0
+    assert snapshot["connectors"]["kv_connector_enabled"] is False
+
+
+def test_scheduler_diagnostic_snapshot_treats_zero_age_as_known():
+    scheduler = create_scheduler()
+    unknown_age, zero_age = create_requests(num_requests=2)
+    unknown_age.arrival_time = None
+    zero_age.arrival_time = 1000.0
+
+    snapshot = scheduler._make_requests_diagnostic_snapshot(
+        [unknown_age, zero_age], now_s=1000.0
+    )
+
+    assert snapshot["oldest_sampled_age_s"] == 0.0
+    assert snapshot["oldest_sampled_request_id"] == zero_age.request_id
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

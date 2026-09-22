@@ -39,9 +39,10 @@ If other strategies don't solve the problem, it's likely that the vLLM instance 
 - `export VLLM_ENGINE_SLOW_STAGE_DUMP_S=60` to dump bounded, sanitized scheduler
   state and Python stack traces when a V1 model-execution stage exceeds the
   timeout. It defaults to `0` (disabled), adds runtime overhead while enabled,
-  throttles repeated dumps, and omits prompt and token values. Stack traces can
-  contain source file paths. The watchdog requires a Python thread to run and
-  cannot report native-code stalls that hold the Python GIL indefinitely.
+  throttles repeated dumps, and omits prompt and token values. Bounded request
+  identifiers may appear in diagnostic logs, and stack traces can contain
+  source file paths. The watchdog requires a Python thread to run and cannot
+  report native-code stalls that hold the Python GIL indefinitely.
 - `export VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH=/local/path` to persist private,
   per-rank diagnostic bundles for engine exceptions and slow-stage timeouts.
   Bundles include engine context, bounded scheduler/request/KV-cache snapshots,

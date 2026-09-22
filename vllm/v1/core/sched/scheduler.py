@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable, Sized
+from collections.abc import Callable, Iterable, Sized
 from dataclasses import replace
 from typing import Any
 
@@ -25,7 +25,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-from vllm.logging_utils.dump_input import make_request_id_summary
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
@@ -40,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.diagnostics import make_request_id_summary
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -2774,35 +2774,71 @@ class Scheduler(SchedulerInterface):
         now_s = time.time()
         return {
             "schema_version": 1,
-            "scheduler": {
-                "current_step": self.current_step,
-                "deferred_free_fences": len(self.deferred_frees),
-                "deferred_free_blocks": sum(
-                    len(blocks) for _, blocks in self.deferred_frees
-                ),
-                "finished_req_ids": len(self.finished_req_ids),
-                "max_model_len": self.max_model_len,
-                "max_num_running_reqs": self.max_num_running_reqs,
-                "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
-                "num_known_reqs": len(self.requests),
-                "num_waiting_for_streaming_input": (
-                    self.num_waiting_for_streaming_input
-                ),
-                "pause_state": self._pause_state.name,
-                "policy": self.policy.value,
-                "prefill_capacity_bound": self.prefill_capacity_bound,
-                "processed_step_seq": self.processed_step_seq,
-            },
+            "scheduler": self._capture_diagnostic_snapshot_section(
+                "scheduler", self._make_scheduler_diagnostic_snapshot
+            ),
             "requests": {
-                "running": self._make_requests_diagnostic_snapshot(self.running, now_s),
-                "waiting": self._make_requests_diagnostic_snapshot(self.waiting, now_s),
-                "skipped_waiting": self._make_requests_diagnostic_snapshot(
-                    self.skipped_waiting, now_s
+                "running": self._capture_diagnostic_snapshot_section(
+                    "requests.running",
+                    lambda: self._make_requests_diagnostic_snapshot(
+                        self.running, now_s
+                    ),
+                ),
+                "waiting": self._capture_diagnostic_snapshot_section(
+                    "requests.waiting",
+                    lambda: self._make_requests_diagnostic_snapshot(
+                        self.waiting, now_s
+                    ),
+                ),
+                "skipped_waiting": self._capture_diagnostic_snapshot_section(
+                    "requests.skipped_waiting",
+                    lambda: self._make_requests_diagnostic_snapshot(
+                        self.skipped_waiting, now_s
+                    ),
                 ),
             },
-            "kv_cache": self._make_kv_cache_diagnostic_snapshot(),
-            "encoder_cache": self._make_encoder_cache_diagnostic_snapshot(),
-            "connectors": self._make_connector_diagnostic_snapshot(),
+            "kv_cache": self._capture_diagnostic_snapshot_section(
+                "kv_cache", self._make_kv_cache_diagnostic_snapshot
+            ),
+            "encoder_cache": self._capture_diagnostic_snapshot_section(
+                "encoder_cache", self._make_encoder_cache_diagnostic_snapshot
+            ),
+            "connectors": self._capture_diagnostic_snapshot_section(
+                "connectors", self._make_connector_diagnostic_snapshot
+            ),
+        }
+
+    @staticmethod
+    def _capture_diagnostic_snapshot_section(
+        section: str,
+        make_snapshot: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            return make_snapshot()
+        except Exception:
+            logger.exception(
+                "Failed to collect scheduler diagnostic snapshot section '%s'",
+                section,
+            )
+            return {"error": "snapshot_unavailable"}
+
+    def _make_scheduler_diagnostic_snapshot(self) -> dict[str, Any]:
+        return {
+            "current_step": self.current_step,
+            "deferred_free_fences": len(self.deferred_frees),
+            "deferred_free_blocks": sum(
+                len(blocks) for _, blocks in self.deferred_frees
+            ),
+            "finished_req_ids": len(self.finished_req_ids),
+            "max_model_len": self.max_model_len,
+            "max_num_running_reqs": self.max_num_running_reqs,
+            "max_num_scheduled_tokens": self.max_num_scheduled_tokens,
+            "num_known_reqs": len(self.requests),
+            "num_waiting_for_streaming_input": self.num_waiting_for_streaming_input,
+            "pause_state": self._pause_state.name,
+            "policy": self.policy.value,
+            "prefill_capacity_bound": self.prefill_capacity_bound,
+            "processed_step_seq": self.processed_step_seq,
         }
 
     def _make_requests_diagnostic_snapshot(
@@ -2830,7 +2866,7 @@ class Scheduler(SchedulerInterface):
         ]
         oldest_sample = max(
             request_samples,
-            key=lambda sample: sample["age_s"] or -1.0,
+            key=lambda sample: sample["age_s"] if sample["age_s"] is not None else -1.0,
             default=None,
         )
 
@@ -2889,6 +2925,7 @@ class Scheduler(SchedulerInterface):
     def _make_kv_cache_diagnostic_snapshot(self) -> dict[str, Any]:
         block_pool = self.kv_cache_manager.block_pool
         num_free_blocks = block_pool.get_num_free_blocks()
+        # BlockPool permanently reserves one GPU block as its null block.
         num_allocatable_blocks = block_pool.num_gpu_blocks - 1
         return {
             "num_allocatable_blocks": num_allocatable_blocks,
