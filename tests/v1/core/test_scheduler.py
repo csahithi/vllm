@@ -63,6 +63,30 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+def test_scheduler_diagnostic_snapshot_bounds_priority_request_samples():
+    scheduler = create_scheduler(scheduling_policy="priority")
+    requests = create_requests(num_requests=21)
+    for index, request in enumerate(requests):
+        request.priority = len(requests) - index
+        scheduler.add_request(request)
+    waiting_before = [request.request_id for request in scheduler.waiting]
+
+    snapshot = scheduler.make_diagnostic_snapshot()
+
+    waiting = snapshot["requests"]["waiting"]
+    sampled_request_ids = [request["request_id"] for request in waiting["requests"]]
+    assert waiting["count"] == 21
+    assert waiting["sample_limit"] == 20
+    assert waiting["sampled_count"] == 20
+    assert len(waiting["requests"]) == 20
+    assert waiting["truncated"] is True
+    assert sampled_request_ids == waiting_before[:20]
+    assert [request.request_id for request in scheduler.waiting] == waiting_before
+    assert len(scheduler.waiting) == 21
+    assert snapshot["kv_cache"]["num_gpu_blocks"] == 10000
+    assert snapshot["encoder_cache"]["num_cached_entries"] == 0
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

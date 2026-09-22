@@ -136,6 +136,7 @@ def dump_engine_exception(
     scheduler_stats: SchedulerStats | None,
     error: Exception | None = None,
     scheduler_snapshot: dict[str, Any] | None = None,
+    scheduler_snapshot_fn: Callable[[], dict[str, Any] | None] | None = None,
 ):
     # NOTE: ensure we can log extra info without risking raises
     # unexpected errors during logging
@@ -147,6 +148,7 @@ def dump_engine_exception(
             scheduler_stats,
             error=error,
             scheduler_snapshot=scheduler_snapshot,
+            scheduler_snapshot_fn=scheduler_snapshot_fn,
         )
 
 
@@ -158,6 +160,22 @@ def dump_engine_execution_timeout(
     scheduler_snapshot: dict[str, Any] | None = None,
 ):
     _emit_engine_execution_timeout(stage, timeout_s)
+    _dump_engine_execution_timeout_details(
+        config,
+        snapshot,
+        timeout_s,
+        stage,
+        scheduler_snapshot,
+    )
+
+
+def _dump_engine_execution_timeout_details(
+    config: VllmConfig,
+    snapshot: EngineExecutionTimeoutSnapshot,
+    timeout_s: float,
+    stage: str,
+    scheduler_snapshot: dict[str, Any] | None,
+) -> None:
 
     diagnostic_bundle_dir: Path | None = None
     try:
@@ -224,10 +242,13 @@ def _dump_engine_timeout_context(
             scheduler_queue_dump,
         )
     if scheduler_snapshot is not None:
-        logger.error(
-            "Scheduler diagnostic snapshot: %s",
-            _serialize_diagnostic(scheduler_snapshot),
-        )
+        try:
+            logger.error(
+                "Scheduler diagnostic snapshot: %s",
+                _serialize_diagnostic(scheduler_snapshot),
+            )
+        except Exception:
+            logger.exception("Failed to log V1 scheduler diagnostic snapshot")
     return _write_engine_diagnostic_bundle(
         reason="timeout",
         config=config,
@@ -472,7 +493,7 @@ def _make_new_request_sample(
         "num_prefill_tokens": _optional_len(request.prefill_token_ids),
         "num_prompt_tokens": _optional_len(request.prompt_token_ids),
         "prompt_embeds_shape": prompt_embeds_shape,
-        **_make_request_id_summary(request_id),
+        **make_request_id_summary(request_id),
         "request_kind": "new",
         "sampling_params": make_sampling_params_summary(request.sampling_params),
         **_make_scheduled_request_summary(request_id, scheduler_output),
@@ -495,14 +516,14 @@ def _make_cached_request_sample(
         "num_new_blocks": _num_blocks(new_block_ids),
         "num_new_tokens": _optional_len(new_token_ids),
         "num_output_tokens": _item_at(cached_requests.num_output_tokens, index),
-        **_make_request_id_summary(request_id),
+        **make_request_id_summary(request_id),
         "request_kind": "cached",
         "sampling_params": (cached_sampling_params or {}).get(request_id),
         **_make_scheduled_request_summary(request_id, scheduler_output),
     }
 
 
-def _make_request_id_summary(request_id: str) -> dict[str, Any]:
+def make_request_id_summary(request_id: str) -> dict[str, Any]:
     if len(request_id) <= ENGINE_EXECUTION_TIMEOUT_REQUEST_ID_MAX_CHARS:
         return {"request_id": request_id}
 
@@ -615,6 +636,7 @@ def _dump_engine_execution_context(
     timeout_s: float | None = None,
     error: Exception | None = None,
     scheduler_snapshot: dict[str, Any] | None = None,
+    scheduler_snapshot_fn: Callable[[], dict[str, Any] | None] | None = None,
 ) -> Path | None:
     logger.error(
         "Dumping input data for V1 LLM engine (v%s, reason=%s) with config: %s, ",
@@ -664,6 +686,7 @@ def _dump_engine_execution_context(
         timeout_s=timeout_s,
         error=error,
         scheduler_snapshot=scheduler_snapshot,
+        scheduler_snapshot_fn=scheduler_snapshot_fn,
     )
 
 
@@ -681,10 +704,30 @@ def _write_engine_diagnostic_bundle_with_timeout(
     timeout_s: float | None,
     error: Exception | None,
     scheduler_snapshot: dict[str, Any] | None = None,
+    scheduler_snapshot_fn: Callable[[], dict[str, Any] | None] | None = None,
 ) -> Path | None:
     result: list[Path] = []
 
     def write_bundle() -> None:
+        captured_scheduler_snapshot = scheduler_snapshot
+        if captured_scheduler_snapshot is None and scheduler_snapshot_fn is not None:
+            try:
+                captured_scheduler_snapshot = scheduler_snapshot_fn()
+            except Exception:
+                logger.exception("Failed to collect V1 scheduler diagnostic snapshot")
+
+        if (
+            captured_scheduler_snapshot is not None
+            and scheduler_snapshot_fn is not None
+        ):
+            try:
+                logger.error(
+                    "Dumping scheduler diagnostic snapshot: %s",
+                    _serialize_diagnostic(captured_scheduler_snapshot),
+                )
+            except Exception:
+                logger.exception("Failed to log V1 scheduler diagnostic snapshot")
+
         bundle_dir = _write_engine_diagnostic_bundle(
             reason=reason,
             config=config,
@@ -697,10 +740,10 @@ def _write_engine_diagnostic_bundle_with_timeout(
             stage=stage,
             timeout_s=timeout_s,
             error=error,
-            scheduler_snapshot=scheduler_snapshot,
+            scheduler_snapshot=captured_scheduler_snapshot,
         )
         expected_files = ["context.json"]
-        if scheduler_snapshot is not None:
+        if captured_scheduler_snapshot is not None:
             expected_files.append("scheduler_snapshot.json")
         if bundle_dir is not None and _finalize_engine_diagnostic_bundle(
             bundle_dir, expected_files=tuple(expected_files)
@@ -755,12 +798,18 @@ def _write_engine_diagnostic_bundle(
         )
         scheduler_snapshot_file: str | None = None
         if scheduler_snapshot is not None:
-            scheduler_snapshot_file = "scheduler_snapshot.json"
-            _write_engine_diagnostic_json(
-                bundle_dir / scheduler_snapshot_file,
-                scheduler_snapshot,
-                max_bytes=ENGINE_DIAGNOSTIC_CONTEXT_MAX_BYTES,
-            )
+            scheduler_snapshot_path = bundle_dir / "scheduler_snapshot.json"
+            try:
+                _write_engine_diagnostic_json(
+                    scheduler_snapshot_path,
+                    scheduler_snapshot,
+                    max_bytes=ENGINE_DIAGNOSTIC_CONTEXT_MAX_BYTES,
+                )
+                scheduler_snapshot_file = "scheduler_snapshot.json"
+            except Exception:
+                with contextlib.suppress(OSError):
+                    scheduler_snapshot_path.unlink()
+                logger.exception("Failed to write V1 scheduler diagnostic snapshot")
         context = {
             "bundle_version": ENGINE_DIAGNOSTIC_BUNDLE_VERSION,
             "config_summary": config_summary,
@@ -1282,8 +1331,7 @@ class EngineExecutionTimeoutWatchdog:
         state: _EngineExecutionTimeoutState,
         timeout_s: float,
     ) -> None:
-        scheduler_snapshot = self._make_scheduler_snapshot()
-        if scheduler_snapshot is None:
+        if self.scheduler_snapshot_fn is None:
             dump_engine_execution_timeout(
                 self.config,
                 state.snapshot,
@@ -1291,12 +1339,15 @@ class EngineExecutionTimeoutWatchdog:
                 state.stage,
             )
             return
-        dump_engine_execution_timeout(
+
+        _emit_engine_execution_timeout(state.stage, timeout_s)
+        scheduler_snapshot = self._make_scheduler_snapshot()
+        _dump_engine_execution_timeout_details(
             self.config,
             state.snapshot,
             timeout_s,
             state.stage,
-            scheduler_snapshot=scheduler_snapshot,
+            scheduler_snapshot,
         )
 
     def _make_scheduler_snapshot(self) -> dict[str, Any] | None:

@@ -30,6 +30,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
+from vllm.v1.request import Request, RequestStatus
 
 
 class FakeEngineCore:
@@ -383,6 +384,30 @@ def test_scheduler_diagnostic_snapshot_summarizes_requests_and_resources(
     assert snapshot["connectors"]["kv_connector_pending_push_work"]
 
 
+def test_scheduler_diagnostic_snapshot_bounds_real_request_id():
+    request_id = f"request-{'x' * 500}-suffix"
+    request = Request(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        arrival_time=990.0,
+    )
+    request.status = RequestStatus.RUNNING
+
+    snapshot = Scheduler._make_request_diagnostic_snapshot(
+        cast(Any, None), request, now_s=1000.0
+    )
+
+    assert snapshot["age_s"] == 10.0
+    assert snapshot["num_prompt_tokens"] == 3
+    assert snapshot["status"] == "RUNNING"
+    assert snapshot["request_id"] == f"{request_id[:160]}...{request_id[-64:]}"
+    assert snapshot["request_id_length"] == len(request_id)
+    assert snapshot["request_id_truncated"] is True
+    assert len(snapshot["request_id_sha256"]) == 64
+
+
 def test_make_scheduler_diagnostic_snapshot_returns_none_on_failure():
     def raise_snapshot_error():
         raise RuntimeError("snapshot failed")
@@ -703,10 +728,15 @@ def test_engine_execution_timeout_real_timeout_emits_useful_summary(monkeypatch)
         "dump_traceback",
         lambda *args, **kwargs: traceback_dumped.set(),
     )
+
+    def make_scheduler_snapshot():
+        assert traceback_dumped.is_set()
+        return scheduler_snapshot
+
     watchdog = dump_input.EngineExecutionTimeoutWatchdog(
         config=make_timeout_config(),
         timeout_s=0.01,
-        scheduler_snapshot_fn=lambda: scheduler_snapshot,
+        scheduler_snapshot_fn=make_scheduler_snapshot,
     )
     watchdog.start()
 
@@ -731,7 +761,14 @@ def test_engine_execution_timeout_real_timeout_emits_useful_summary(monkeypatch)
     assert "request-456" in combined_logs
     assert "temperature" in combined_logs
     assert "num_running_reqs" in combined_logs
-    assert '"schema_version":1' in combined_logs
+    snapshot_log = next(
+        message
+        for message in logs
+        if message.startswith("Scheduler diagnostic snapshot: ")
+    )
+    assert json.loads(snapshot_log.removeprefix("Scheduler diagnostic snapshot: ")) == (
+        scheduler_snapshot
+    )
     assert "private-stop-string" not in combined_logs
     assert "private/model/path" not in combined_logs
 
@@ -784,7 +821,7 @@ def test_log_error_detail_forwards_and_reraises_original_error(monkeypatch):
         actual_stats,
         *,
         error,
-        scheduler_snapshot,
+        scheduler_snapshot_fn,
     ):
         calls.append(
             (
@@ -792,7 +829,7 @@ def test_log_error_detail_forwards_and_reraises_original_error(monkeypatch):
                 actual_output,
                 actual_stats,
                 error,
-                scheduler_snapshot,
+                scheduler_snapshot_fn,
             )
         )
 
@@ -806,9 +843,45 @@ def test_log_error_detail_forwards_and_reraises_original_error(monkeypatch):
         raise error
 
     assert caught.value is error
-    assert calls == [
-        (config, scheduler_output, scheduler_stats, error, scheduler_snapshot)
-    ]
+    assert len(calls) == 1
+    assert calls[0][:4] == (config, scheduler_output, scheduler_stats, error)
+    assert calls[0][4]() is scheduler_snapshot
+
+
+def test_dump_engine_exception_does_not_wait_for_scheduler_snapshot(
+    tmp_path, monkeypatch
+):
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    bundle_written = threading.Event()
+
+    def make_scheduler_snapshot():
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2.0)
+        return {"schema_version": 1}
+
+    def record_bundle(**kwargs):
+        assert kwargs["scheduler_snapshot"] == {"schema_version": 1}
+        bundle_written.set()
+        return None
+
+    config = enable_engine_diagnostic_bundles(monkeypatch, tmp_path)
+    monkeypatch.setattr(dump_input, "ENGINE_DIAGNOSTIC_WRITE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(dump_input, "_write_engine_diagnostic_bundle", record_bundle)
+
+    try:
+        dump_input.dump_engine_exception(
+            config,
+            SimpleNamespace(request_id="req-1"),
+            None,
+            scheduler_snapshot_fn=make_scheduler_snapshot,
+        )
+
+        assert snapshot_started.wait(timeout=1.0)
+        assert not bundle_written.is_set()
+    finally:
+        release_snapshot.set()
+    assert bundle_written.wait(timeout=1.0)
 
 
 def test_engine_execution_context_writes_diagnostic_bundle(tmp_path, monkeypatch):
@@ -867,6 +940,41 @@ def test_engine_execution_context_writes_diagnostic_bundle(tmp_path, monkeypatch
         )
 
 
+def test_scheduler_snapshot_write_failure_preserves_diagnostic_bundle(
+    tmp_path, monkeypatch
+):
+    real_write_json = dump_input._write_engine_diagnostic_json
+
+    def fail_scheduler_snapshot(path, value, *, max_bytes):
+        if path.name == "scheduler_snapshot.json":
+            raise ValueError("snapshot too large")
+        real_write_json(path, value, max_bytes=max_bytes)
+
+    monkeypatch.setattr(
+        dump_input,
+        "_write_engine_diagnostic_json",
+        fail_scheduler_snapshot,
+    )
+    bundle_dir = dump_input._dump_engine_execution_context(
+        reason="exception",
+        config=enable_engine_diagnostic_bundles(monkeypatch, tmp_path),
+        scheduler_output=SimpleNamespace(request_id="req-1"),
+        scheduler_stats=None,
+        scheduler_snapshot={"schema_version": 1},
+    )
+
+    assert bundle_dir is not None
+    context = json.loads((bundle_dir / "context.json").read_text(encoding="utf-8"))
+    assert context["scheduler_snapshot_file"] is None
+    assert not (bundle_dir / "scheduler_snapshot.json").exists()
+    manifest = json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["complete"] is False
+    assert manifest["artifacts"] == {
+        "context.json": "written",
+        "scheduler_snapshot.json": "failed",
+    }
+
+
 def test_engine_execution_context_ignores_compilation_debug_dump_path(
     tmp_path, monkeypatch
 ):
@@ -893,6 +1001,7 @@ def test_engine_execution_timeout_writes_stack_bundle(tmp_path, monkeypatch):
     monkeypatch.setattr(dump_input.faulthandler, "dump_traceback", record_traceback)
     scheduler_output = make_timeout_scheduler_output()
     scheduler_output.scheduled_new_reqs[0].req_id = "req-2"
+    scheduler_snapshot = {"schema_version": 1, "kv_cache": {"usage": 0.5}}
 
     dump_input.dump_engine_execution_timeout(
         config=enable_engine_diagnostic_bundles(monkeypatch, tmp_path),
@@ -902,6 +1011,7 @@ def test_engine_execution_timeout_writes_stack_bundle(tmp_path, monkeypatch):
         ),
         timeout_s=2.0,
         stage=engine_core_module.EXECUTE_MODEL_WAIT_STAGE,
+        scheduler_snapshot=scheduler_snapshot,
     )
 
     dump_root = tmp_path / "rank_0_dp_0" / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
@@ -920,15 +1030,24 @@ def test_engine_execution_timeout_writes_stack_bundle(tmp_path, monkeypatch):
         == "req-2"
     )
     assert context["scheduler_queue_summary"]["num_waiting_reqs"] == 2
-    assert context["scheduler_snapshot_file"] is None
+    assert context["scheduler_snapshot_file"] == "scheduler_snapshot.json"
     assert context["exception"] is None
+    assert (
+        json.loads((bundles[0] / "scheduler_snapshot.json").read_text(encoding="utf-8"))
+        == scheduler_snapshot
+    )
     manifest = json.loads((bundles[0] / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["complete"] is True
     assert manifest["artifacts"] == {
         "context.json": "written",
+        "scheduler_snapshot.json": "written",
         "stacks.txt": "written",
     }
-    assert manifest["files"] == ["context.json", "stacks.txt"]
+    assert manifest["files"] == [
+        "context.json",
+        "scheduler_snapshot.json",
+        "stacks.txt",
+    ]
 
 
 def test_engine_execution_timeout_stack_failure_is_fail_open(tmp_path, monkeypatch):

@@ -553,7 +553,7 @@ class EngineCore:
                 scheduler_output,
                 self.scheduler.make_stats(),
                 error=err,
-                scheduler_snapshot=self.make_scheduler_diagnostic_snapshot(),
+                scheduler_snapshot_fn=self.make_scheduler_diagnostic_snapshot,
             )
             raise err
 

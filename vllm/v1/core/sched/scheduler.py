@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.logging_utils.dump_input import make_request_id_summary
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
@@ -2810,9 +2811,17 @@ class Scheduler(SchedulerInterface):
         now_s: float,
     ) -> dict[str, Any]:
         request_count = len(requests) if isinstance(requests, Sized) else None
+        if isinstance(requests, RequestQueue):
+            sampled_requests = requests.get_request_samples(
+                DIAGNOSTIC_REQUEST_SAMPLE_LIMIT
+            )
+        else:
+            sampled_requests = itertools.islice(
+                requests, DIAGNOSTIC_REQUEST_SAMPLE_LIMIT
+            )
         request_samples = [
             self._make_request_diagnostic_snapshot(request, now_s)
-            for request in itertools.islice(requests, DIAGNOSTIC_REQUEST_SAMPLE_LIMIT)
+            for request in sampled_requests
         ]
         sampled_ages_s = [
             sample["age_s"]
@@ -2872,7 +2881,7 @@ class Scheduler(SchedulerInterface):
             "num_spec_tokens": len(request.spec_token_ids),
             "num_tokens": request.num_tokens,
             "priority": request.priority,
-            "request_id": request.request_id,
+            **make_request_id_summary(request.request_id),
             "status": status_name,
             "use_structured_output": request.use_structured_output,
         }
