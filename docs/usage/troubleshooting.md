@@ -51,6 +51,14 @@ If other strategies don't solve the problem, it's likely that the vLLM instance 
   exception, and source-path data, and only the newest 20 finalized bundles per
   rank are retained. Timeout persistence uses one background writer per engine
   watchdog so filesystem stalls cannot block later stderr diagnostics.
+- `export VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S=300` to dump engine progress,
+  scheduler state, and Python stack traces when an engine core has pending work
+  but no forward progress for the configured timeout. This monitor is disabled
+  by default.
+- `export VLLM_DEBUG_STACK_TRACE_SIGNAL=SIGUSR1` to install an on-demand Python
+  stack trace handler in API server, engine core, and worker processes. Send the
+  configured signal to each vLLM process you want to inspect to dump all Python
+  thread stacks for those processes into their stderr/log stream.
 - `export CUDA_LAUNCH_BLOCKING=1` to identify which CUDA kernel is causing the problem.
 - `export NCCL_DEBUG=TRACE` to turn on more logging for NCCL.
 - `export VLLM_TRACE_FUNCTION=1` to record all function calls for inspection in the log files to tell which function crashes or hangs. (WARNING: This flag will slow down the token generation by **over 100x**. Do not use unless absolutely needed.)

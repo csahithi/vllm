@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
     VLLM_ENGINE_SLOW_STAGE_DUMP_S: int = 0
+    VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S: float = 0.0
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
@@ -288,6 +289,7 @@ if TYPE_CHECKING:
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH: str | None = None
+    VLLM_DEBUG_STACK_TRACE_SIGNAL: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
     VLLM_USE_NCCL_SYMM_MEM: bool = False
@@ -772,6 +774,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH": lambda: os.environ.get(
         "VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH", None
     ),
+    # Install a signal handler that dumps Python stack traces in each process.
+    "VLLM_DEBUG_STACK_TRACE_SIGNAL": lambda: os.environ.get(
+        "VLLM_DEBUG_STACK_TRACE_SIGNAL", None
+    ),
     # Feature flag to enable/disable AOT compilation. This will ensure
     # compilation is done in warmup phase and the compilation will be
     # reused in subsequent calls.
@@ -801,6 +807,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout for diagnostic dumps of slow V1 engine execution stages.
     "VLLM_ENGINE_SLOW_STAGE_DUMP_S": lambda: int(
         os.environ.get("VLLM_ENGINE_SLOW_STAGE_DUMP_S", "0")
+    ),
+    # Timeout for diagnostics when the engine core has pending work but makes
+    # no forward progress. Disabled by default.
+    "VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S": lambda: float(
+        os.environ.get("VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S", "0")
     ),
     # Timeout in seconds for waiting for engine cores to become ready
     # during startup. Default is 600 seconds (10 minutes).
@@ -2267,6 +2278,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH",
+        "VLLM_DEBUG_STACK_TRACE_SIGNAL",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
@@ -2309,6 +2321,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_ENGINE_SLOW_STAGE_DUMP_S",
+        "VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
