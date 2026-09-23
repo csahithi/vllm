@@ -51,7 +51,7 @@ ENGINE_EXECUTION_TIMEOUT_SUMMARY_MAX_CHARS = 32_768
 ENGINE_EXECUTION_TIMEOUT_WATCHDOG_STOP_TIMEOUT_S = 1.0
 STACK_TRACE_SIGNAL_ENV_VAR = "VLLM_DEBUG_STACK_TRACE_SIGNAL"
 ENGINE_NO_PROGRESS_STAGE = "no_forward_progress"
-_PROTECTED_STACK_TRACE_SIGNAL_NAMES = ("SIGINT", "SIGTERM", "SIGKILL", "SIGSTOP")
+_SAFE_STACK_TRACE_SIGNAL_NAMES = ("SIGUSR1", "SIGUSR2")
 _engine_diagnostic_bundle_lock = threading.Lock()
 _stack_trace_signal_handler_lock = threading.Lock()
 _stack_trace_signal_handlers: dict[int, str] = {}
@@ -230,7 +230,6 @@ def _emit_engine_execution_timeout(stage: str, timeout_s: float) -> None:
 
 def dump_engine_no_progress(
     config: VllmConfig,
-    scheduler_stats: SchedulerStats | None,
     timeout_s: float,
     progress_snapshot: dict[str, Any],
     scheduler_snapshot: dict[str, Any] | None = None,
@@ -272,9 +271,7 @@ def dump_engine_no_progress(
                 scheduler_output_summary=None,
                 scheduler_queue_summary=None,
                 scheduler_output_text=None,
-                scheduler_stats_text=(
-                    str(scheduler_stats) if scheduler_stats is not None else None
-                ),
+                scheduler_stats_text=None,
                 stage=ENGINE_NO_PROGRESS_STAGE,
                 timeout_s=timeout_s,
                 error=None,
@@ -304,7 +301,6 @@ class EngineCoreProgressMonitor:
         process_name: str,
         timeout_s: float | None,
         has_work_fn: Callable[[], bool],
-        scheduler_stats_fn: Callable[[], SchedulerStats | None],
         scheduler_snapshot_fn: Callable[[], dict[str, Any] | None],
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -312,7 +308,6 @@ class EngineCoreProgressMonitor:
         self.process_name = process_name
         self.timeout_s = timeout_s
         self.has_work_fn = has_work_fn
-        self.scheduler_stats_fn = scheduler_stats_fn
         self.scheduler_snapshot_fn = scheduler_snapshot_fn
         self.time_fn = time_fn
 
@@ -324,6 +319,7 @@ class EngineCoreProgressMonitor:
         self._progress_index = 0
         self._last_activity_s = now_s
         self._last_progress_s = now_s
+        self._operation_active = False
         self._last_dump_progress_index = -1
         self._last_dump_s = 0.0
         self._stop_event = threading.Event()
@@ -331,19 +327,31 @@ class EngineCoreProgressMonitor:
 
     @property
     def enabled(self) -> bool:
-        return self.timeout_s is not None and self.timeout_s > 0
+        return (
+            self.timeout_s is not None
+            and self.timeout_s > 0
+            and not self._stop_event.is_set()
+        )
 
     def start(self) -> None:
         timeout_s = self.timeout_s
-        if timeout_s is None or timeout_s <= 0 or self._thread is not None:
+        if not self.enabled or self._thread is not None:
             return
 
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"{self.process_name}NoProgressMonitor",
-            daemon=True,
-        )
-        self._thread.start()
+        try:
+            thread = self._create_thread()
+            self._thread = thread
+            thread.start()
+        except Exception:
+            self._thread = None
+            self._stop_event.set()
+            logger.warning(
+                "Failed to start EngineCore no-progress monitor for %s. "
+                "Continuing without no-progress monitoring.",
+                self.process_name,
+                exc_info=True,
+            )
+            return
         logger.info(
             "Started EngineCore no-progress monitor for %s with timeout %.2fs.",
             self.process_name,
@@ -362,6 +370,7 @@ class EngineCoreProgressMonitor:
     ) -> None:
         with self._lock:
             self._record_activity_unlocked(stage, details)
+            self._operation_active = True
 
     def record_progress(
         self,
@@ -369,9 +378,11 @@ class EngineCoreProgressMonitor:
         details: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
-            self._record_activity_unlocked(stage, details)
-            self._progress_index += 1
-            self._last_progress_s = self._last_activity_s
+            self._record_progress_unlocked(stage, details)
+
+    def record_idle(self) -> None:
+        with self._lock:
+            self._record_progress_unlocked("idle", {"has_work": False})
 
     def snapshot(self) -> dict[str, Any]:
         now_s = self.time_fn()
@@ -383,18 +394,23 @@ class EngineCoreProgressMonitor:
         if timeout_s is None or timeout_s <= 0:
             return False
 
-        try:
-            has_work = self.has_work_fn()
-        except Exception:
-            logger.exception("Failed to query EngineCore work state")
-            return False
+        with self._lock:
+            operation_active = self._operation_active
 
-        if not has_work:
-            self.record_progress("idle", {"has_work": False})
-            return False
+        if operation_active:
+            has_work = True
+        else:
+            try:
+                has_work = self.has_work_fn()
+            except Exception:
+                logger.exception("Failed to query EngineCore work state")
+                return False
 
         now_s = self.time_fn()
         with self._lock:
+            if not has_work and not self._operation_active:
+                self._record_progress_unlocked("idle", {"has_work": False})
+                return False
             elapsed_s = now_s - self._last_progress_s
             if elapsed_s < timeout_s:
                 return False
@@ -409,7 +425,6 @@ class EngineCoreProgressMonitor:
 
         dump_engine_no_progress(
             self.config,
-            self._make_scheduler_stats(),
             timeout_s,
             progress_snapshot,
             self._make_scheduler_snapshot(),
@@ -429,6 +444,13 @@ class EngineCoreProgressMonitor:
             return 5.0
         return min(max(timeout_s / 4, 0.1), 5.0)
 
+    def _create_thread(self) -> threading.Thread:
+        return threading.Thread(
+            target=self._run,
+            name=f"{self.process_name}NoProgressMonitor",
+            daemon=True,
+        )
+
     def _record_activity_unlocked(
         self,
         stage: str,
@@ -439,6 +461,16 @@ class EngineCoreProgressMonitor:
         self._details = details or {}
         self._last_activity_s = self.time_fn()
 
+    def _record_progress_unlocked(
+        self,
+        stage: str,
+        details: dict[str, Any] | None,
+    ) -> None:
+        self._record_activity_unlocked(stage, details)
+        self._operation_active = False
+        self._progress_index += 1
+        self._last_progress_s = self._last_activity_s
+
     def _snapshot_unlocked(self, now_s: float) -> dict[str, Any]:
         return {
             "activity_index": self._activity_index,
@@ -446,6 +478,7 @@ class EngineCoreProgressMonitor:
             "elapsed_since_progress_s": max(0.0, now_s - self._last_progress_s),
             "last_activity_s": self._last_activity_s,
             "last_progress_s": self._last_progress_s,
+            "operation_active": self._operation_active,
             "pid": os.getpid(),
             "process_name": self.process_name,
             "progress_index": self._progress_index,
@@ -453,13 +486,6 @@ class EngineCoreProgressMonitor:
             "stage_details": self._details,
             "timeout_s": self.timeout_s,
         }
-
-    def _make_scheduler_stats(self) -> SchedulerStats | None:
-        try:
-            return self.scheduler_stats_fn()
-        except Exception:
-            logger.exception("Failed to collect V1 scheduler stats")
-            return None
 
     def _make_scheduler_snapshot(self) -> dict[str, Any] | None:
         try:
@@ -485,9 +511,10 @@ def install_stack_trace_signal_handler(process_name: str) -> bool:
         return False
 
     signal_name = _format_signal_name(signum)
-    if _is_protected_stack_trace_signal(signum):
+    if not _is_safe_stack_trace_signal(signum):
         logger.warning(
-            "Ignoring %s=%r because %s is reserved for process control.",
+            "Ignoring %s=%r because %s is not a supported diagnostic signal. "
+            "Use SIGUSR1 or SIGUSR2.",
             STACK_TRACE_SIGNAL_ENV_VAR,
             signal_value,
             signal_name,
@@ -507,6 +534,15 @@ def install_stack_trace_signal_handler(process_name: str) -> bool:
             return True
 
         try:
+            existing_handler = signal.getsignal(signum)
+            if existing_handler != signal.SIG_DFL:
+                logger.warning(
+                    "Ignoring %s=%r because %s already has a signal handler.",
+                    STACK_TRACE_SIGNAL_ENV_VAR,
+                    signal_value,
+                    signal_name,
+                )
+                return False
             faulthandler.register(
                 signum,
                 file=sys.stderr,
@@ -559,10 +595,10 @@ def _format_signal_name(signum: int) -> str:
         return str(signum)
 
 
-def _is_protected_stack_trace_signal(signum: int) -> bool:
-    for signal_name in _PROTECTED_STACK_TRACE_SIGNAL_NAMES:
-        protected_signum = getattr(signal, signal_name, None)
-        if isinstance(protected_signum, int) and int(protected_signum) == signum:
+def _is_safe_stack_trace_signal(signum: int) -> bool:
+    for signal_name in _SAFE_STACK_TRACE_SIGNAL_NAMES:
+        safe_signum = getattr(signal, signal_name, None)
+        if isinstance(safe_signum, int) and int(safe_signum) == signum:
             return True
     return False
 

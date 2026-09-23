@@ -1276,16 +1276,20 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
-            self.progress_monitor = EngineCoreProgressMonitor(
-                config=vllm_config,
-                process_name=f"EngineCore_{self.engine_index}",
-                timeout_s=envs.VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S,
-                has_work_fn=self.has_work,
-                scheduler_stats_fn=self.scheduler.make_stats,
-                scheduler_snapshot_fn=self.make_scheduler_diagnostic_snapshot,
-            )
-            self.progress_monitor.record_progress("initialized")
-            self.progress_monitor.start()
+            self.progress_monitor: EngineCoreProgressMonitor | None = None
+            no_progress_timeout_s = envs.VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S
+            if no_progress_timeout_s is not None and no_progress_timeout_s > 0:
+                progress_monitor = EngineCoreProgressMonitor(
+                    config=vllm_config,
+                    process_name=f"EngineCore_{self.engine_index}",
+                    timeout_s=no_progress_timeout_s,
+                    has_work_fn=self.has_work,
+                    scheduler_snapshot_fn=self.make_scheduler_diagnostic_snapshot,
+                )
+                progress_monitor.record_progress("initialized")
+                progress_monitor.start()
+                if progress_monitor.enabled:
+                    self.progress_monitor = progress_monitor
 
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
@@ -1624,12 +1628,16 @@ class EngineCoreProc(EngineCore):
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
-        self.progress_monitor.record_activity("process_input_queue")
+        progress_monitor = self.progress_monitor
+        if progress_monitor is not None:
+            progress_monitor.record_activity("process_input_queue")
         waited = False
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
+                if progress_monitor is not None:
+                    progress_monitor.record_idle()
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
                     self.aborts_queue.queue.clear()
@@ -1639,7 +1647,7 @@ class EngineCoreProc(EngineCore):
             block = self.process_input_queue_block
             try:
                 req = self.input_queue.get(block=block)
-                self._handle_client_request(*req)
+                self._process_client_request(*req)
             except queue.Empty:
                 break
             if not block:
@@ -1651,12 +1659,27 @@ class EngineCoreProc(EngineCore):
         # Handle any more client requests.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
+            self._process_client_request(*req)
+
+    def _process_client_request(
+        self, request_type: EngineCoreRequestType, request: Any
+    ) -> None:
+        progress_monitor = self.progress_monitor
+        if progress_monitor is None:
+            self._handle_client_request(request_type, request)
+            return
+
+        stage = f"client_request_{request_type.name.lower()}"
+        progress_monitor.record_activity(stage)
+        self._handle_client_request(request_type, request)
+        progress_monitor.record_progress(stage)
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
         # Step the engine core.
-        self.progress_monitor.record_activity("engine_step")
+        progress_monitor = self.progress_monitor
+        if progress_monitor is not None:
+            progress_monitor.record_activity("engine_step")
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
@@ -1664,18 +1687,23 @@ class EngineCoreProc(EngineCore):
         # Post-step hook.
         self.post_step(model_executed)
 
-        num_outputs = (
-            sum(len(eco.outputs) for eco in outputs.values()) if outputs else 0
-        )
-        has_pending_work = self.scheduler.has_requests()
-        if model_executed or num_outputs or not has_pending_work:
-            self.progress_monitor.record_progress(
-                "engine_step",
-                {
-                    "has_pending_work": has_pending_work,
-                    "model_executed": model_executed,
-                    "num_outputs": num_outputs,
-                },
+        if progress_monitor is not None:
+            num_outputs = (
+                sum(len(eco.outputs) for eco in outputs.values()) if outputs else 0
+            )
+            has_pending_work = self.scheduler.has_requests()
+            if model_executed or num_outputs or not has_pending_work:
+                progress_monitor.record_progress(
+                    "engine_step",
+                    {
+                        "has_pending_work": has_pending_work,
+                        "model_executed": model_executed,
+                        "num_outputs": num_outputs,
+                    },
+                )
+        else:
+            has_pending_work = (
+                self.scheduler.has_requests() if not model_executed else False
             )
 
         # If no model execution happened but there is still scheduler work
@@ -1697,7 +1725,8 @@ class EngineCoreProc(EngineCore):
             return True
 
         if self.shutdown_state == EngineShutdownState.REQUESTED:
-            self.progress_monitor.record_progress("shutdown_requested")
+            if self.progress_monitor is not None:
+                self.progress_monitor.record_progress("shutdown_requested")
             shutdown_timeout = self.vllm_config.shutdown_timeout
             mode = "abort" if shutdown_timeout == 0 else "drain"
 
@@ -1774,10 +1803,6 @@ class EngineCoreProc(EngineCore):
                 "Unrecognized input request type encountered: %s", request_type
             )
             return
-
-        self.progress_monitor.record_progress(
-            f"client_request_{request_type.name.lower()}"
-        )
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -2363,7 +2388,6 @@ class DPEngineCoreProc(EngineCoreProc):
                         new_wave,
                     )
                     self.engines_running = True
-                self.progress_monitor.record_progress("client_request_start_dp_wave")
         else:
             super()._handle_client_request(request_type, request)
 
@@ -2405,12 +2429,15 @@ class DPEngineCoreProc(EngineCoreProc):
             self._maybe_publish_request_counts()
 
             if self.eep_scaling_state is not None:
-                self.progress_monitor.record_activity("elastic_ep_progress")
+                progress_monitor = self.progress_monitor
+                if progress_monitor is not None:
+                    progress_monitor.record_activity("elastic_ep_progress")
                 state = self.eep_scaling_state
                 if state.commit_requested or not state.is_ready_for_switch():
                     state.progress()
                 if state.is_complete():
-                    self.progress_monitor.record_progress("elastic_ep_progress")
+                    if progress_monitor is not None:
+                        progress_monitor.record_progress("elastic_ep_progress")
                     if state.worker_type == "removing":
                         raise SystemExit
                     self.process_input_queue_block = True
@@ -2431,9 +2458,12 @@ class DPEngineCoreProc(EngineCoreProc):
                 # engine is sleeping.
                 elif not self.model_executor.is_sleeping:
                     with self.capture_iteration_details(None) as iteration_details:
-                        self.progress_monitor.record_activity("execute_dummy_batch")
+                        progress_monitor = self.progress_monitor
+                        if progress_monitor is not None:
+                            progress_monitor.record_activity("execute_dummy_batch")
                         self.execute_dummy_batch()
-                        self.progress_monitor.record_progress("execute_dummy_batch")
+                        if progress_monitor is not None:
+                            progress_monitor.record_progress("execute_dummy_batch")
                     if iteration_details is not None and not self.has_coordinator:
                         stats = self._make_iteration_details_stats(iteration_details)
                         self.output_queue.put_nowait(
@@ -2441,13 +2471,16 @@ class DPEngineCoreProc(EngineCoreProc):
                         )
 
             # 3) All-reduce operation to determine global unfinished reqs.
-            self.progress_monitor.record_activity("dp_global_sync")
+            progress_monitor = self.progress_monitor
+            if progress_monitor is not None:
+                progress_monitor.record_activity("dp_global_sync")
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
             )
-            self.progress_monitor.record_progress(
-                "dp_global_sync", {"engines_running": self.engines_running}
-            )
+            if progress_monitor is not None:
+                progress_monitor.record_progress(
+                    "dp_global_sync", {"engines_running": self.engines_running}
+                )
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
