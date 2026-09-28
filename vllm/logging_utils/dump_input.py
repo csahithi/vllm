@@ -49,6 +49,7 @@ ENGINE_DIAGNOSTIC_WRITE_TIMEOUT_S = 1.0
 ENGINE_EXECUTION_TIMEOUT_REQUEST_SAMPLE_LIMIT = 20
 ENGINE_EXECUTION_TIMEOUT_SUMMARY_MAX_CHARS = 32_768
 ENGINE_EXECUTION_TIMEOUT_WATCHDOG_STOP_TIMEOUT_S = 1.0
+ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S = 1.0
 STACK_TRACE_SIGNAL_ENV_VAR = "VLLM_DEBUG_STACK_TRACE_SIGNAL"
 ENGINE_NO_PROGRESS_STAGE = "no_forward_progress"
 _SAFE_STACK_TRACE_SIGNAL_NAMES = ("SIGUSR1", "SIGUSR2")
@@ -228,15 +229,10 @@ def _emit_engine_execution_timeout(stage: str, timeout_s: float) -> None:
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
 
 
-def dump_engine_no_progress(
-    config: VllmConfig,
+def _emit_engine_no_progress(
     timeout_s: float,
     progress_snapshot: dict[str, Any],
-    scheduler_snapshot: dict[str, Any] | None = None,
 ) -> None:
-    combined_snapshot = _combine_no_progress_snapshots(
-        progress_snapshot, scheduler_snapshot
-    )
     with contextlib.suppress(Exception):
         logger.error(
             "V1 LLM engine has not made forward progress for %.2f seconds "
@@ -249,6 +245,26 @@ def dump_engine_no_progress(
             progress_snapshot.get("stage"),
             ENGINE_EXECUTION_TIMEOUT_DUMP_THROTTLE_S,
         )
+
+    with contextlib.suppress(Exception):
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+
+
+def dump_engine_no_progress(
+    config: VllmConfig,
+    timeout_s: float,
+    progress_snapshot: dict[str, Any],
+    scheduler_snapshot: dict[str, Any] | None = None,
+    *,
+    emit_traceback: bool = True,
+) -> None:
+    if emit_traceback:
+        _emit_engine_no_progress(timeout_s, progress_snapshot)
+
+    combined_snapshot = _combine_no_progress_snapshots(
+        progress_snapshot, scheduler_snapshot
+    )
+    with contextlib.suppress(Exception):
         logger.error(
             "Engine no-progress diagnostic snapshot: %s",
             _serialize_diagnostic(combined_snapshot),
@@ -287,9 +303,6 @@ def dump_engine_no_progress(
             expected_files=("context.json", "scheduler_snapshot.json", "stacks.txt"),
         )
 
-    with contextlib.suppress(Exception):
-        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-
 
 class EngineCoreProgressMonitor:
     """Tracks EngineCore activity and dumps diagnostics on no progress."""
@@ -324,6 +337,8 @@ class EngineCoreProgressMonitor:
         self._last_dump_s = 0.0
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._diagnostic_thread: threading.Thread | None = None
+        self._check_failure_logged = False
 
     @property
     def enabled(self) -> bool:
@@ -361,7 +376,21 @@ class EngineCoreProgressMonitor:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None and threading.current_thread() is not self._thread:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S)
+
+        with self._lock:
+            diagnostic_thread = self._diagnostic_thread
+        if (
+            diagnostic_thread is not None
+            and threading.current_thread() is not diagnostic_thread
+        ):
+            diagnostic_thread.join(timeout=ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S)
+            if diagnostic_thread.is_alive():
+                logger.warning(
+                    "EngineCore no-progress diagnostic writer did not stop "
+                    "within %.1f seconds",
+                    ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S,
+                )
 
     def record_activity(
         self,
@@ -423,20 +452,26 @@ class EngineCoreProgressMonitor:
             self._last_dump_progress_index = self._progress_index
             self._last_dump_s = now_s
 
-        dump_engine_no_progress(
-            self.config,
-            timeout_s,
-            progress_snapshot,
-            self._make_scheduler_snapshot(),
-        )
+        _emit_engine_no_progress(timeout_s, progress_snapshot)
+        self._dispatch_no_progress_dump(timeout_s, progress_snapshot)
         return True
 
     def _run(self) -> None:
         if not self.enabled:
             return
         while not self._stop_event.wait(self._check_interval_s()):
-            with contextlib.suppress(Exception):
+            try:
                 self.maybe_dump_no_progress()
+            except Exception:
+                if not self._check_failure_logged:
+                    self._check_failure_logged = True
+                    with contextlib.suppress(Exception):
+                        logger.exception(
+                            "EngineCore no-progress monitor failed for %s; "
+                            "continuing to monitor with timeout %.2fs",
+                            self.process_name,
+                            self.timeout_s,
+                        )
 
     def _check_interval_s(self) -> float:
         timeout_s = self.timeout_s
@@ -450,6 +485,88 @@ class EngineCoreProgressMonitor:
             name=f"{self.process_name}NoProgressMonitor",
             daemon=True,
         )
+
+    def _dispatch_no_progress_dump(
+        self,
+        timeout_s: float,
+        progress_snapshot: dict[str, Any],
+    ) -> bool:
+        creation_error: Exception | None = None
+        with self._lock:
+            diagnostic_thread = self._diagnostic_thread
+            if diagnostic_thread is not None and diagnostic_thread.is_alive():
+                write_in_flight = True
+                next_thread = None
+            else:
+                write_in_flight = False
+                try:
+                    next_thread = threading.Thread(
+                        target=self._dump_no_progress,
+                        args=(timeout_s, progress_snapshot),
+                        name=f"{self.process_name}NoProgressDiagnostic",
+                        daemon=True,
+                    )
+                    self._diagnostic_thread = next_thread
+                except Exception as err:
+                    creation_error = err
+                    next_thread = None
+
+        if write_in_flight:
+            logger.warning(
+                "Skipping detailed no-progress diagnostics for %s because a "
+                "previous diagnostic write is still in progress",
+                self.process_name,
+            )
+            return False
+
+        if next_thread is None:
+            logger.warning(
+                "Unable to create the no-progress diagnostic writer for %s; "
+                "continuing with stderr output only: %s",
+                self.process_name,
+                creation_error,
+            )
+            return False
+
+        try:
+            next_thread.start()
+        except Exception as err:
+            with self._lock:
+                if self._diagnostic_thread is next_thread:
+                    self._diagnostic_thread = None
+            logger.warning(
+                "Unable to start the no-progress diagnostic writer for %s; "
+                "continuing with stderr output only: %s",
+                self.process_name,
+                err,
+            )
+            return False
+        return True
+
+    def _dump_no_progress(
+        self,
+        timeout_s: float,
+        progress_snapshot: dict[str, Any],
+    ) -> None:
+        current_thread = threading.current_thread()
+        try:
+            scheduler_snapshot = self._make_scheduler_snapshot()
+            dump_engine_no_progress(
+                self.config,
+                timeout_s,
+                progress_snapshot,
+                scheduler_snapshot,
+                emit_traceback=False,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to prepare detailed no-progress diagnostics for %s",
+                self.process_name,
+            )
+        finally:
+            with self._lock:
+                if self._diagnostic_thread is current_thread:
+                    self._diagnostic_thread = None
 
     def _record_activity_unlocked(
         self,

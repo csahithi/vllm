@@ -2462,7 +2462,7 @@ class DPEngineCoreProc(EngineCoreProc):
                         if progress_monitor is not None:
                             progress_monitor.record_activity("execute_dummy_batch")
                         self.execute_dummy_batch()
-                        if progress_monitor is not None:
+                        if progress_monitor is not None and not local_unfinished_reqs:
                             progress_monitor.record_progress("execute_dummy_batch")
                     if iteration_details is not None and not self.has_coordinator:
                         stats = self._make_iteration_details_stats(iteration_details)
@@ -2477,7 +2477,7 @@ class DPEngineCoreProc(EngineCoreProc):
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
             )
-            if progress_monitor is not None:
+            if progress_monitor is not None and not local_unfinished_reqs:
                 progress_monitor.record_progress(
                     "dp_global_sync", {"engines_running": self.engines_running}
                 )
@@ -2666,6 +2666,7 @@ class EngineCoreActorMixin:
             process_kind="engine_core",
             process_name=f"DPEngineCoreActor_DP{dp_rank}",
         )
+        install_stack_trace_signal_handler(f"{type(self).__name__}_DP{dp_rank}")
 
         self.addresses = addresses
         vllm_config.parallel_config.data_parallel_index = dp_rank
