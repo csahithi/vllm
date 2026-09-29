@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import threading
@@ -48,7 +49,13 @@ ENGINE_DIAGNOSTIC_WRITE_TIMEOUT_S = 1.0
 ENGINE_EXECUTION_TIMEOUT_REQUEST_SAMPLE_LIMIT = 20
 ENGINE_EXECUTION_TIMEOUT_SUMMARY_MAX_CHARS = 32_768
 ENGINE_EXECUTION_TIMEOUT_WATCHDOG_STOP_TIMEOUT_S = 1.0
+ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S = 1.0
+STACK_TRACE_SIGNAL_ENV_VAR = "VLLM_DEBUG_STACK_TRACE_SIGNAL"
+ENGINE_NO_PROGRESS_STAGE = "no_forward_progress"
+_SAFE_STACK_TRACE_SIGNAL_NAMES = ("SIGUSR1", "SIGUSR2")
 _engine_diagnostic_bundle_lock = threading.Lock()
+_stack_trace_signal_handler_lock = threading.Lock()
+_stack_trace_signal_handlers: dict[tuple[int, int], str] = {}
 _ENGINE_TIMEOUT_MODEL_CONFIG_FIELDS = (
     "dtype",
     "enforce_eager",
@@ -220,6 +227,510 @@ def _emit_engine_execution_timeout(stage: str, timeout_s: float) -> None:
 
     with contextlib.suppress(Exception):
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+
+
+def _emit_engine_no_progress(
+    timeout_s: float,
+    progress_snapshot: dict[str, Any],
+) -> None:
+    with contextlib.suppress(Exception):
+        logger.error(
+            "V1 LLM engine has not made forward progress for %.2f seconds "
+            "(pid=%d, stage=%s). Dumping engine progress, scheduler state, "
+            "and Python stack traces. Further no-progress dumps are "
+            "throttled for %.0f seconds. Set "
+            "VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S=0 to disable this diagnostic.",
+            timeout_s,
+            os.getpid(),
+            progress_snapshot.get("stage"),
+            ENGINE_EXECUTION_TIMEOUT_DUMP_THROTTLE_S,
+        )
+
+    with contextlib.suppress(Exception):
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+
+
+def dump_engine_no_progress(
+    config: VllmConfig,
+    timeout_s: float,
+    progress_snapshot: dict[str, Any],
+    scheduler_snapshot: dict[str, Any] | None = None,
+    *,
+    emit_traceback: bool = True,
+) -> None:
+    if emit_traceback:
+        _emit_engine_no_progress(timeout_s, progress_snapshot)
+
+    combined_snapshot = _combine_no_progress_snapshots(
+        progress_snapshot, scheduler_snapshot
+    )
+    with contextlib.suppress(Exception):
+        logger.error(
+            "Engine no-progress diagnostic snapshot: %s",
+            _serialize_diagnostic(combined_snapshot),
+        )
+
+    diagnostic_bundle_dir: Path | None = None
+    dump_root = _engine_diagnostic_dump_root(config)
+    if dump_root is not None:
+        try:
+            try:
+                config_summary = _make_engine_config_summary(config)
+            except Exception:
+                logger.exception("Failed to prepare engine diagnostic config summary")
+                config_summary = {"summary_unavailable": True}
+            diagnostic_bundle_dir = _write_engine_diagnostic_bundle(
+                reason="no_progress",
+                config=config,
+                dump_root=dump_root,
+                config_summary=config_summary,
+                scheduler_output_summary=None,
+                scheduler_queue_summary=None,
+                scheduler_output_text=None,
+                scheduler_stats_text=None,
+                stage=ENGINE_NO_PROGRESS_STAGE,
+                timeout_s=timeout_s,
+                error=None,
+                scheduler_snapshot=combined_snapshot,
+            )
+        except Exception:
+            logger.exception("Failed to write V1 engine no-progress context")
+
+    if diagnostic_bundle_dir is not None:
+        _write_engine_traceback_dump(diagnostic_bundle_dir)
+        _finalize_engine_diagnostic_bundle(
+            diagnostic_bundle_dir,
+            expected_files=("context.json", "scheduler_snapshot.json", "stacks.txt"),
+        )
+
+
+class EngineCoreProgressMonitor:
+    """Tracks EngineCore activity and dumps diagnostics on no progress."""
+
+    def __init__(
+        self,
+        *,
+        config: VllmConfig,
+        process_name: str,
+        timeout_s: float | None,
+        has_work_fn: Callable[[], bool],
+        scheduler_snapshot_fn: Callable[[], dict[str, Any] | None],
+        time_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.config = config
+        self.process_name = process_name
+        self.timeout_s = timeout_s
+        self.has_work_fn = has_work_fn
+        self.scheduler_snapshot_fn = scheduler_snapshot_fn
+        self.time_fn = time_fn
+
+        now_s = self.time_fn()
+        self._lock = threading.Lock()
+        self._stage = "initializing"
+        self._details: dict[str, Any] = {}
+        self._activity_index = 0
+        self._progress_index = 0
+        self._last_activity_s = now_s
+        self._last_progress_s = now_s
+        self._operation_active = False
+        self._last_dump_progress_index = -1
+        self._last_dump_s = 0.0
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._diagnostic_thread: threading.Thread | None = None
+        self._check_failure_logged = False
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.timeout_s is not None
+            and self.timeout_s > 0
+            and not self._stop_event.is_set()
+        )
+
+    def start(self) -> None:
+        timeout_s = self.timeout_s
+        if not self.enabled or self._thread is not None:
+            return
+
+        try:
+            thread = self._create_thread()
+            self._thread = thread
+            thread.start()
+        except Exception:
+            self._thread = None
+            self._stop_event.set()
+            logger.warning(
+                "Failed to start EngineCore no-progress monitor for %s. "
+                "Continuing without no-progress monitoring.",
+                self.process_name,
+                exc_info=True,
+            )
+            return
+        logger.info(
+            "Started EngineCore no-progress monitor for %s with timeout %.2fs.",
+            self.process_name,
+            timeout_s,
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S)
+
+        with self._lock:
+            diagnostic_thread = self._diagnostic_thread
+        if (
+            diagnostic_thread is not None
+            and threading.current_thread() is not diagnostic_thread
+        ):
+            diagnostic_thread.join(timeout=ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S)
+            if diagnostic_thread.is_alive():
+                logger.warning(
+                    "EngineCore no-progress diagnostic writer did not stop "
+                    "within %.1f seconds",
+                    ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S,
+                )
+
+    def record_activity(
+        self,
+        stage: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock:
+            self._record_activity_unlocked(stage, details)
+            self._operation_active = True
+
+    def record_progress(
+        self,
+        stage: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock:
+            self._record_progress_unlocked(stage, details)
+
+    def record_idle(self) -> None:
+        with self._lock:
+            self._record_progress_unlocked("idle", {"has_work": False})
+
+    def snapshot(self) -> dict[str, Any]:
+        now_s = self.time_fn()
+        with self._lock:
+            return self._snapshot_unlocked(now_s)
+
+    def maybe_dump_no_progress(self) -> bool:
+        timeout_s = self.timeout_s
+        if timeout_s is None or timeout_s <= 0:
+            return False
+
+        with self._lock:
+            operation_active = self._operation_active
+
+        if operation_active:
+            has_work = True
+        else:
+            try:
+                has_work = self.has_work_fn()
+            except Exception:
+                logger.exception("Failed to query EngineCore work state")
+                return False
+
+        now_s = self.time_fn()
+        with self._lock:
+            if not has_work and not self._operation_active:
+                self._record_progress_unlocked("idle", {"has_work": False})
+                return False
+            elapsed_s = now_s - self._last_progress_s
+            if elapsed_s < timeout_s:
+                return False
+            if (
+                self._last_dump_progress_index == self._progress_index
+                and now_s - self._last_dump_s < ENGINE_EXECUTION_TIMEOUT_DUMP_THROTTLE_S
+            ):
+                return False
+            progress_snapshot = self._snapshot_unlocked(now_s)
+            self._last_dump_progress_index = self._progress_index
+            self._last_dump_s = now_s
+
+        _emit_engine_no_progress(timeout_s, progress_snapshot)
+        self._dispatch_no_progress_dump(timeout_s, progress_snapshot)
+        return True
+
+    def _run(self) -> None:
+        if not self.enabled:
+            return
+        while not self._stop_event.wait(self._check_interval_s()):
+            try:
+                self.maybe_dump_no_progress()
+            except Exception:
+                if not self._check_failure_logged:
+                    self._check_failure_logged = True
+                    with contextlib.suppress(Exception):
+                        logger.exception(
+                            "EngineCore no-progress monitor failed for %s; "
+                            "continuing to monitor with timeout %.2fs",
+                            self.process_name,
+                            self.timeout_s,
+                        )
+
+    def _check_interval_s(self) -> float:
+        timeout_s = self.timeout_s
+        if timeout_s is None:
+            return 5.0
+        return min(max(timeout_s / 4, 0.1), 5.0)
+
+    def _create_thread(self) -> threading.Thread:
+        return threading.Thread(
+            target=self._run,
+            name=f"{self.process_name}NoProgressMonitor",
+            daemon=True,
+        )
+
+    def _dispatch_no_progress_dump(
+        self,
+        timeout_s: float,
+        progress_snapshot: dict[str, Any],
+    ) -> bool:
+        creation_error: Exception | None = None
+        with self._lock:
+            diagnostic_thread = self._diagnostic_thread
+            if diagnostic_thread is not None and diagnostic_thread.is_alive():
+                write_in_flight = True
+                next_thread = None
+            else:
+                write_in_flight = False
+                try:
+                    next_thread = threading.Thread(
+                        target=self._dump_no_progress,
+                        args=(timeout_s, progress_snapshot),
+                        name=f"{self.process_name}NoProgressDiagnostic",
+                        daemon=True,
+                    )
+                    self._diagnostic_thread = next_thread
+                except Exception as err:
+                    creation_error = err
+                    next_thread = None
+
+        if write_in_flight:
+            logger.warning(
+                "Skipping detailed no-progress diagnostics for %s because a "
+                "previous diagnostic write is still in progress",
+                self.process_name,
+            )
+            return False
+
+        if next_thread is None:
+            logger.warning(
+                "Unable to create the no-progress diagnostic writer for %s; "
+                "continuing with stderr output only: %s",
+                self.process_name,
+                creation_error,
+            )
+            return False
+
+        try:
+            next_thread.start()
+        except Exception as err:
+            with self._lock:
+                if self._diagnostic_thread is next_thread:
+                    self._diagnostic_thread = None
+            logger.warning(
+                "Unable to start the no-progress diagnostic writer for %s; "
+                "continuing with stderr output only: %s",
+                self.process_name,
+                err,
+            )
+            return False
+        return True
+
+    def _dump_no_progress(
+        self,
+        timeout_s: float,
+        progress_snapshot: dict[str, Any],
+    ) -> None:
+        current_thread = threading.current_thread()
+        try:
+            scheduler_snapshot = self._make_scheduler_snapshot()
+            dump_engine_no_progress(
+                self.config,
+                timeout_s,
+                progress_snapshot,
+                scheduler_snapshot,
+                emit_traceback=False,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to prepare detailed no-progress diagnostics for %s",
+                self.process_name,
+            )
+        finally:
+            with self._lock:
+                if self._diagnostic_thread is current_thread:
+                    self._diagnostic_thread = None
+
+    def _record_activity_unlocked(
+        self,
+        stage: str,
+        details: dict[str, Any] | None,
+    ) -> None:
+        self._activity_index += 1
+        self._stage = stage
+        self._details = details or {}
+        self._last_activity_s = self.time_fn()
+
+    def _record_progress_unlocked(
+        self,
+        stage: str,
+        details: dict[str, Any] | None,
+    ) -> None:
+        self._record_activity_unlocked(stage, details)
+        self._operation_active = False
+        self._progress_index += 1
+        self._last_progress_s = self._last_activity_s
+
+    def _snapshot_unlocked(self, now_s: float) -> dict[str, Any]:
+        return {
+            "activity_index": self._activity_index,
+            "elapsed_since_activity_s": max(0.0, now_s - self._last_activity_s),
+            "elapsed_since_progress_s": max(0.0, now_s - self._last_progress_s),
+            "last_activity_s": self._last_activity_s,
+            "last_progress_s": self._last_progress_s,
+            "operation_active": self._operation_active,
+            "pid": os.getpid(),
+            "process_name": self.process_name,
+            "progress_index": self._progress_index,
+            "stage": self._stage,
+            "stage_details": self._details,
+            "timeout_s": self.timeout_s,
+        }
+
+    def _make_scheduler_snapshot(self) -> dict[str, Any] | None:
+        try:
+            return self.scheduler_snapshot_fn()
+        except Exception:
+            logger.exception("Failed to collect V1 scheduler diagnostic snapshot")
+            return None
+
+
+def install_stack_trace_signal_handler(process_name: str) -> bool:
+    signal_value = envs.VLLM_DEBUG_STACK_TRACE_SIGNAL
+    if not signal_value:
+        return False
+
+    signum = _parse_stack_trace_signal(signal_value)
+    if signum is None:
+        logger.warning(
+            "Ignoring invalid %s=%r. Use a signal name such as SIGUSR1 or "
+            "a positive signal number.",
+            STACK_TRACE_SIGNAL_ENV_VAR,
+            signal_value,
+        )
+        return False
+
+    signal_name = _format_signal_name(signum)
+    if not _is_safe_stack_trace_signal(signum):
+        logger.warning(
+            "Ignoring %s=%r because %s is not a supported diagnostic signal. "
+            "Use SIGUSR1 or SIGUSR2.",
+            STACK_TRACE_SIGNAL_ENV_VAR,
+            signal_value,
+            signal_name,
+        )
+        return False
+
+    process_id = os.getpid()
+    handler_key = (process_id, signum)
+    with _stack_trace_signal_handler_lock:
+        installed_process = _stack_trace_signal_handlers.get(handler_key)
+        if installed_process is not None:
+            logger.debug(
+                "Stack trace signal handler for %s is already installed in "
+                "%s (pid=%d).",
+                signal_name,
+                installed_process,
+                process_id,
+            )
+            return True
+
+        try:
+            existing_handler = signal.getsignal(signum)
+            if existing_handler != signal.SIG_DFL:
+                logger.warning(
+                    "Ignoring %s=%r because %s already has a signal handler "
+                    "visible to Python's signal module.",
+                    STACK_TRACE_SIGNAL_ENV_VAR,
+                    signal_value,
+                    signal_name,
+                )
+                return False
+            faulthandler.register(
+                signum,
+                file=sys.stderr,
+                all_threads=True,
+                chain=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to install stack trace signal handler for %s=%r in "
+                "%s (pid=%d): %s",
+                STACK_TRACE_SIGNAL_ENV_VAR,
+                signal_value,
+                process_name,
+                process_id,
+                exc,
+            )
+            return False
+
+        _stack_trace_signal_handlers[handler_key] = process_name
+
+    logger.info(
+        "Installed stack trace signal handler for %s in %s (pid=%d).",
+        signal_name,
+        process_name,
+        process_id,
+    )
+    return True
+
+
+def _parse_stack_trace_signal(signal_value: str) -> int | None:
+    normalized = signal_value.strip().upper()
+    if not normalized:
+        return None
+
+    if normalized.isdecimal():
+        signum = int(normalized)
+        return signum if signum > 0 else None
+
+    signal_name = normalized if normalized.startswith("SIG") else f"SIG{normalized}"
+    signum = getattr(signal, signal_name, None)
+    if isinstance(signum, int) and signum > 0:
+        return int(signum)
+    return None
+
+
+def _format_signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return str(signum)
+
+
+def _is_safe_stack_trace_signal(signum: int) -> bool:
+    for signal_name in _SAFE_STACK_TRACE_SIGNAL_NAMES:
+        safe_signum = getattr(signal, signal_name, None)
+        if isinstance(safe_signum, int) and int(safe_signum) == signum:
+            return True
+    return False
+
+
+def _combine_no_progress_snapshots(
+    progress_snapshot: dict[str, Any],
+    scheduler_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    combined_snapshot: dict[str, Any] = {"engine_progress": progress_snapshot}
+    if scheduler_snapshot is not None:
+        combined_snapshot["scheduler"] = scheduler_snapshot
+    return combined_snapshot
 
 
 def _dump_engine_timeout_context(

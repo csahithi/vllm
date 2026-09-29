@@ -268,6 +268,10 @@ class WorkerWrapperBase:
 
         load_general_plugins()
 
+        from vllm.logging_utils.dump_input import install_stack_trace_signal_handler
+
+        install_stack_trace_signal_handler(f"Worker_{self.global_rank}")
+
         parallel_config = vllm_config.parallel_config
         if isinstance(parallel_config.worker_cls, str):
             worker_class: type[WorkerBase] = resolve_obj_by_qualname(

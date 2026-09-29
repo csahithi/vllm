@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import json
 import os
+import signal
 import stat
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
@@ -27,10 +32,11 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 
 class FakeEngineCore:
@@ -162,6 +168,39 @@ class FakeStageEngine:
 
     def _attach_iteration_details(self, outputs, iteration_details):
         return
+
+
+class FakeDiagnosticWorker:
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
+class FakeProgressMonitor:
+    def __init__(self) -> None:
+        self.activities: list[tuple[str, dict[str, Any] | None]] = []
+        self.progress: list[tuple[str, dict[str, Any] | None]] = []
+
+    def record_activity(
+        self, stage: str, details: dict[str, Any] | None = None
+    ) -> None:
+        self.activities.append((stage, details))
+
+    def record_progress(
+        self, stage: str, details: dict[str, Any] | None = None
+    ) -> None:
+        self.progress.append((stage, details))
+
+    def record_idle(self) -> None:
+        self.record_progress("idle", {"has_work": False})
+
+
+@pytest.fixture(autouse=True)
+def reset_stack_trace_signal_handler_state() -> Iterator[None]:
+    with dump_input._stack_trace_signal_handler_lock:
+        dump_input._stack_trace_signal_handlers.clear()
+    yield
+    with dump_input._stack_trace_signal_handler_lock:
+        dump_input._stack_trace_signal_handlers.clear()
 
 
 def make_timeout_scheduler_output() -> SimpleNamespace:
@@ -2064,3 +2103,721 @@ def test_step_with_batch_queue_uses_queued_future_stage():
         ("call", "sample_tokens.result"),
         ("exit", engine_core_module.SAMPLE_TOKENS_WAIT_STAGE),
     ]
+
+
+def test_parse_stack_trace_signal_accepts_names_and_numbers(monkeypatch):
+    monkeypatch.setattr(dump_input.signal, "SIGUSR1", 10, raising=False)
+
+    assert dump_input._parse_stack_trace_signal("SIGUSR1") == 10
+    assert dump_input._parse_stack_trace_signal("usr1") == 10
+    assert dump_input._parse_stack_trace_signal("10") == 10
+    assert dump_input._parse_stack_trace_signal("") is None
+    assert dump_input._parse_stack_trace_signal("SIG_DOES_NOT_EXIST") is None
+
+
+def test_install_stack_trace_signal_handler_registers_once(monkeypatch):
+    registered: list[dict[str, Any]] = []
+
+    def record_register(signum: int, **kwargs: Any) -> None:
+        registered.append(
+            {
+                "all_threads": kwargs["all_threads"],
+                "chain": kwargs["chain"],
+                "file": kwargs["file"],
+                "signum": signum,
+            }
+        )
+
+    monkeypatch.setattr(dump_input.signal, "SIGUSR1", 10, raising=False)
+    monkeypatch.setattr(
+        dump_input.signal, "getsignal", lambda _signum: dump_input.signal.SIG_DFL
+    )
+    monkeypatch.setattr(
+        dump_input.envs,
+        "VLLM_DEBUG_STACK_TRACE_SIGNAL",
+        "SIGUSR1",
+        raising=False,
+    )
+    monkeypatch.setattr(dump_input.faulthandler, "register", record_register)
+
+    assert dump_input.install_stack_trace_signal_handler("EngineCore")
+    assert dump_input.install_stack_trace_signal_handler("Worker_0")
+    assert registered == [
+        {
+            "all_threads": True,
+            "chain": False,
+            "file": dump_input.sys.stderr,
+            "signum": 10,
+        }
+    ]
+
+
+def test_install_stack_trace_signal_handler_rejects_unsafe_signal(monkeypatch):
+    registered: list[tuple[Any, ...]] = []
+
+    def record_unexpected_register(*args: Any, **_kwargs: Any) -> None:
+        registered.append(args)
+
+    monkeypatch.setattr(
+        dump_input.envs,
+        "VLLM_DEBUG_STACK_TRACE_SIGNAL",
+        "SIGTERM",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dump_input.faulthandler,
+        "register",
+        record_unexpected_register,
+    )
+
+    assert not dump_input.install_stack_trace_signal_handler("EngineCore")
+    assert not registered
+
+
+def test_install_stack_trace_signal_handler_preserves_existing_handler(monkeypatch):
+    registered: list[tuple[Any, ...]] = []
+
+    monkeypatch.setattr(dump_input.signal, "SIGUSR1", 10, raising=False)
+    monkeypatch.setattr(dump_input.signal, "getsignal", lambda _signum: object())
+    monkeypatch.setattr(
+        dump_input.envs,
+        "VLLM_DEBUG_STACK_TRACE_SIGNAL",
+        "SIGUSR1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dump_input.faulthandler,
+        "register",
+        lambda *args, **_kwargs: registered.append(args),
+    )
+
+    assert not dump_input.install_stack_trace_signal_handler("EngineCore")
+    assert not registered
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork") or not hasattr(signal, "SIGUSR1"),
+    reason="requires fork and SIGUSR1",
+)
+def test_install_stack_trace_signal_handler_reregisters_after_fork():
+    script = """
+import os
+import signal
+from vllm.logging_utils import dump_input
+
+dump_input.envs.VLLM_DEBUG_STACK_TRACE_SIGNAL = "SIGUSR1"
+assert dump_input.install_stack_trace_signal_handler("APIServer")
+child_pid = os.fork()
+if child_pid == 0:
+    registrations = []
+    dump_input.faulthandler.register = (
+        lambda signum, **_kwargs: registrations.append(signum)
+    )
+    try:
+        assert dump_input.install_stack_trace_signal_handler("EngineCore")
+        assert registrations == [signal.SIGUSR1]
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+
+_, child_status = os.waitpid(child_pid, 0)
+assert os.waitstatus_to_exitcode(child_status) == 0
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="requires SIGUSR1")
+def test_stack_trace_signal_handler_dumps_real_subprocess():
+    script = """
+import os
+import signal
+from vllm.logging_utils.dump_input import install_stack_trace_signal_handler
+
+assert install_stack_trace_signal_handler("test-process")
+os.kill(os.getpid(), signal.SIGUSR1)
+print("signal handled")
+"""
+    child_env = os.environ.copy()
+    child_env["VLLM_DEBUG_STACK_TRACE_SIGNAL"] = "SIGUSR1"
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[3],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "signal handled" in result.stdout
+    assert "Current thread" in result.stderr
+    assert 'File "<string>"' in result.stderr
+
+
+def test_worker_init_installs_stack_trace_signal_handler(monkeypatch):
+    calls: list[str] = []
+
+    def record_install(process_name: str) -> bool:
+        calls.append(process_name)
+        return True
+
+    import vllm.plugins as plugins
+
+    monkeypatch.setattr(
+        dump_input,
+        "install_stack_trace_signal_handler",
+        record_install,
+    )
+    monkeypatch.setattr(
+        plugins,
+        "load_general_plugins",
+        lambda: calls.append("plugins_loaded"),
+    )
+
+    config = SimpleNamespace(
+        enable_trace_function_call_for_thread=lambda: None,
+        model_config=SimpleNamespace(multimodal_config=None),
+        parallel_config=SimpleNamespace(
+            worker_cls=f"{__name__}.FakeDiagnosticWorker",
+            worker_extension_cls=None,
+        ),
+    )
+    wrapper = WorkerWrapperBase(rpc_rank=0, global_rank=3)
+
+    wrapper.init_worker(all_kwargs=[{"vllm_config": config}])
+
+    assert calls == ["plugins_loaded", "Worker_3"]
+    assert isinstance(wrapper.worker, FakeDiagnosticWorker)
+
+
+def test_api_server_init_installs_stack_trace_signal_handler(monkeypatch):
+    from vllm.entrypoints.launchers.api_server import entry as api_entry
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    calls: list[str] = []
+    fake_async_llm = SimpleNamespace(
+        reset_mm_cache=lambda: None,
+        shutdown=lambda timeout: None,
+    )
+
+    async def reset_mm_cache() -> None:
+        return None
+
+    fake_async_llm.reset_mm_cache = reset_mm_cache
+    monkeypatch.setattr(
+        dump_input,
+        "install_stack_trace_signal_handler",
+        lambda process_name: calls.append(process_name),
+    )
+    monkeypatch.setattr(
+        AsyncLLM,
+        "from_vllm_config",
+        lambda **_kwargs: fake_async_llm,
+    )
+    engine_args = SimpleNamespace(
+        create_engine_config=lambda **_kwargs: SimpleNamespace(shutdown_timeout=0),
+        enable_log_requests=False,
+        aggregate_engine_logging=False,
+        disable_log_stats=True,
+    )
+
+    async def exercise() -> None:
+        async with api_entry.build_async_engine_client_from_engine_args(
+            engine_args,
+            client_config={"client_count": 2, "client_index": 1},
+        ) as engine:
+            assert engine is fake_async_llm
+
+    asyncio.run(exercise())
+
+    assert calls == ["APIServer_1"]
+
+
+def test_engine_core_init_installs_stack_trace_signal_handler(monkeypatch):
+    calls: list[str] = []
+    run_engine_core = engine_core_module.EngineCoreProc.run_engine_core
+    monkeypatch.setattr(
+        engine_core_module,
+        "install_stack_trace_signal_handler",
+        calls.append,
+    )
+    monkeypatch.setattr(
+        engine_core_module,
+        "maybe_register_config_serialize_by_value",
+        lambda: None,
+    )
+    monkeypatch.setattr(engine_core_module, "set_process_title", lambda _title: None)
+    monkeypatch.setattr(
+        engine_core_module,
+        "maybe_init_worker_tracer",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(engine_core_module, "decorate_logs", lambda: None)
+    monkeypatch.setattr(engine_core_module.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        engine_core_module,
+        "EngineCoreProc",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop")),
+    )
+    parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        data_parallel_rank_local=0,
+        numa_bind=False,
+        data_parallel_index=0,
+        reconfigure_for_independent_dp_rank=lambda: None,
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel_config,
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(is_moe=False),
+    )
+
+    with pytest.raises(RuntimeError, match="stop"):
+        run_engine_core(vllm_config=config)
+
+    assert calls == ["EngineCore"]
+
+
+def test_ray_engine_core_actor_installs_stack_trace_signal_handler(monkeypatch):
+    calls: list[str] = []
+    actor = object.__new__(engine_core_module.EngineCoreActor)
+    monkeypatch.setattr(
+        engine_core_module,
+        "install_stack_trace_signal_handler",
+        calls.append,
+    )
+    monkeypatch.setattr(
+        engine_core_module,
+        "maybe_init_worker_tracer",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        engine_core_module.EngineCoreActorMixin,
+        "_set_nixl_side_channel_host",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        engine_core_module.EngineCoreActorMixin,
+        "_set_visible_devices",
+        lambda _self, _config, _local_dp_rank: None,
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_index=0,
+            data_parallel_rank_local=0,
+        )
+    )
+
+    engine_core_module.EngineCoreActorMixin.__init__(
+        actor,
+        config,
+        addresses=SimpleNamespace(),
+        dp_rank=2,
+        local_dp_rank=0,
+    )
+
+    assert calls == ["EngineCoreActor_DP2"]
+
+
+def test_engine_no_progress_dump_writes_diagnostic_bundle(tmp_path, monkeypatch):
+    traceback_destinations: list[str] = []
+
+    def record_traceback(file, all_threads):
+        assert all_threads
+        traceback_destinations.append("stderr" if file is sys.stderr else "bundle")
+        try:
+            file.write("stack dump\n")
+        except TypeError:
+            file.write(b"stack dump\n")
+
+    monkeypatch.setattr(dump_input.faulthandler, "dump_traceback", record_traceback)
+
+    dump_input.dump_engine_no_progress(
+        config=enable_engine_diagnostic_bundles(monkeypatch, tmp_path),
+        timeout_s=3.0,
+        progress_snapshot={"stage": "engine_step", "progress_index": 1},
+        scheduler_snapshot={"requests": {"running": {"count": 1}}},
+    )
+
+    dump_root = tmp_path / "rank_0_dp_0" / dump_input.ENGINE_DIAGNOSTIC_DUMP_DIR
+    bundles = list(dump_root.iterdir())
+    assert len(bundles) == 1
+    assert traceback_destinations == ["stderr", "bundle"]
+    assert (bundles[0] / "stacks.txt").read_text(encoding="utf-8") == "stack dump\n"
+
+    context = json.loads((bundles[0] / "context.json").read_text(encoding="utf-8"))
+    assert context["reason"] == "no_progress"
+    assert context["stage"] == dump_input.ENGINE_NO_PROGRESS_STAGE
+    assert context["timeout_s"] == 3.0
+    assert context["scheduler_output_text"] is None
+    assert context["scheduler_stats_text"] is None
+    assert context["scheduler_snapshot_file"] == "scheduler_snapshot.json"
+
+    snapshot = json.loads(
+        (bundles[0] / "scheduler_snapshot.json").read_text(encoding="utf-8")
+    )
+    assert snapshot["engine_progress"]["stage"] == "engine_step"
+    assert snapshot["scheduler"]["requests"]["running"]["count"] == 1
+
+    manifest = json.loads((bundles[0] / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["complete"] is True
+    assert manifest["artifacts"] == {
+        "context.json": "written",
+        "scheduler_snapshot.json": "written",
+        "stacks.txt": "written",
+    }
+
+
+def test_progress_monitor_dumps_when_work_stalls(monkeypatch):
+    now_s = 100.0
+    emitted: list[tuple[Any, ...]] = []
+    dispatched: list[tuple[Any, ...]] = []
+    scheduler_snapshot = {"requests": {"waiting": {"count": 1}}}
+    scheduler_snapshot_calls = 0
+
+    def current_time() -> float:
+        return now_s
+
+    def make_scheduler_snapshot() -> dict[str, Any]:
+        nonlocal scheduler_snapshot_calls
+        scheduler_snapshot_calls += 1
+        return scheduler_snapshot
+
+    monitor = dump_input.EngineCoreProgressMonitor(
+        config=SimpleNamespace(),
+        process_name="EngineCore_0",
+        timeout_s=2.0,
+        has_work_fn=lambda: True,
+        scheduler_snapshot_fn=make_scheduler_snapshot,
+        time_fn=current_time,
+    )
+    monitor.record_progress("engine_step")
+    now_s = 102.5
+    monkeypatch.setattr(
+        dump_input,
+        "_emit_engine_no_progress",
+        lambda *args: emitted.append(args),
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_dispatch_no_progress_dump",
+        lambda *args: dispatched.append(args) or True,
+    )
+
+    assert monitor.maybe_dump_no_progress()
+    assert emitted[0][0] == 2.0
+    assert emitted[0][1]["stage"] == "engine_step"
+    assert emitted[0][1]["elapsed_since_progress_s"] == 2.5
+    assert dispatched == [emitted[0]]
+    assert scheduler_snapshot_calls == 0
+
+
+def test_progress_monitor_does_not_dump_when_idle(monkeypatch):
+    now_s = 100.0
+    dumps: list[tuple[Any, ...]] = []
+
+    def current_time() -> float:
+        return now_s
+
+    monitor = dump_input.EngineCoreProgressMonitor(
+        config=SimpleNamespace(),
+        process_name="EngineCore_0",
+        timeout_s=1.0,
+        has_work_fn=lambda: False,
+        scheduler_snapshot_fn=lambda: None,
+        time_fn=current_time,
+    )
+    monitor.record_progress("engine_step")
+    now_s = 101.5
+    monkeypatch.setattr(
+        dump_input,
+        "_emit_engine_no_progress",
+        lambda *args: dumps.append(args),
+    )
+
+    assert not monitor.maybe_dump_no_progress()
+    assert not dumps
+    assert monitor.snapshot()["stage"] == "idle"
+
+
+def test_progress_monitor_dumps_for_active_operation_without_scheduler_work(
+    monkeypatch,
+):
+    now_s = 100.0
+    emitted: list[tuple[Any, ...]] = []
+    dispatched: list[tuple[Any, ...]] = []
+
+    def fail_has_work() -> bool:
+        raise AssertionError("active operation queried scheduler work")
+
+    monitor = dump_input.EngineCoreProgressMonitor(
+        config=SimpleNamespace(),
+        process_name="EngineCore_0",
+        timeout_s=1.0,
+        has_work_fn=fail_has_work,
+        scheduler_snapshot_fn=lambda: None,
+        time_fn=lambda: now_s,
+    )
+    monitor.record_activity("client_request_utility")
+    now_s = 101.5
+    monkeypatch.setattr(
+        dump_input,
+        "_emit_engine_no_progress",
+        lambda *args: emitted.append(args),
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_dispatch_no_progress_dump",
+        lambda *args: dispatched.append(args) or True,
+    )
+
+    assert monitor.maybe_dump_no_progress()
+    assert emitted[0][1]["operation_active"] is True
+    assert emitted[0][1]["stage"] == "client_request_utility"
+    assert dispatched == [emitted[0]]
+
+
+def test_progress_monitor_start_failure_is_fail_open(monkeypatch):
+    class FailingThread:
+        def start(self) -> None:
+            raise RuntimeError("thread startup failed")
+
+    monitor = dump_input.EngineCoreProgressMonitor(
+        config=SimpleNamespace(),
+        process_name="EngineCore_0",
+        timeout_s=1.0,
+        has_work_fn=lambda: True,
+        scheduler_snapshot_fn=lambda: None,
+    )
+    monkeypatch.setattr(monitor, "_create_thread", FailingThread)
+
+    monitor.start()
+
+    assert not monitor.enabled
+    assert monitor._thread is None
+
+
+def test_progress_monitor_thread_survives_check_failure(monkeypatch):
+    recovered = threading.Event()
+    calls = 0
+    logged_errors: list[tuple[Any, ...]] = []
+    monitor = dump_input.EngineCoreProgressMonitor(
+        config=SimpleNamespace(),
+        process_name="EngineCore_0",
+        timeout_s=0.01,
+        has_work_fn=lambda: True,
+        scheduler_snapshot_fn=lambda: None,
+    )
+
+    def flaky_check() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise RuntimeError("diagnostic failure")
+        recovered.set()
+        return False
+
+    monkeypatch.setattr(monitor, "maybe_dump_no_progress", flaky_check)
+    monkeypatch.setattr(
+        dump_input.logger,
+        "exception",
+        lambda *args, **_kwargs: logged_errors.append(args),
+    )
+    monitor.start()
+    try:
+        assert recovered.wait(1.0)
+    finally:
+        monitor.stop()
+
+    assert calls >= 2
+    assert len(logged_errors) == 1
+    assert monitor._thread is not None
+    assert not monitor._thread.is_alive()
+
+
+def test_progress_monitor_diagnostic_writer_is_nonblocking_and_single_flight(
+    monkeypatch,
+):
+    now_s = 100.0
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    check_finished = threading.Event()
+    stop_finished = threading.Event()
+    detailed_dumped = threading.Event()
+    check_results: list[bool] = []
+    diagnostic_events: list[str] = []
+
+    def blocking_snapshot() -> dict[str, Any]:
+        diagnostic_events.append("scheduler_snapshot")
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2.0)
+        return {"requests": {"running": {"count": 1}}}
+
+    monitor = dump_input.EngineCoreProgressMonitor(
+        config=SimpleNamespace(),
+        process_name="EngineCore_0",
+        timeout_s=1.0,
+        has_work_fn=lambda: True,
+        scheduler_snapshot_fn=blocking_snapshot,
+        time_fn=lambda: now_s,
+    )
+    monitor.record_progress("engine_step")
+    now_s = 101.5
+    monkeypatch.setattr(
+        dump_input,
+        "_emit_engine_no_progress",
+        lambda *_args: diagnostic_events.append("stderr"),
+    )
+    monkeypatch.setattr(
+        dump_input,
+        "dump_engine_no_progress",
+        lambda *_args, **_kwargs: detailed_dumped.set(),
+    )
+    monkeypatch.setattr(
+        dump_input,
+        "ENGINE_NO_PROGRESS_MONITOR_STOP_TIMEOUT_S",
+        0.01,
+    )
+
+    def check_no_progress() -> None:
+        check_results.append(monitor.maybe_dump_no_progress())
+        check_finished.set()
+
+    check_thread = threading.Thread(target=check_no_progress)
+    check_thread.start()
+    try:
+        assert check_finished.wait(timeout=1.0)
+        check_thread.join(timeout=1.0)
+        assert check_results == [True]
+        assert snapshot_started.wait(timeout=1.0)
+        assert diagnostic_events[:2] == ["stderr", "scheduler_snapshot"]
+        diagnostic_thread = monitor._diagnostic_thread
+        assert diagnostic_thread is not None
+        assert diagnostic_thread.is_alive()
+        assert not monitor._dispatch_no_progress_dump(1.0, {"stage": "engine_step"})
+
+        stop_thread = threading.Thread(
+            target=lambda: (monitor.stop(), stop_finished.set())
+        )
+        stop_thread.start()
+        assert stop_finished.wait(timeout=1.0)
+        stop_thread.join(timeout=1.0)
+        assert diagnostic_thread.is_alive()
+    finally:
+        release_snapshot.set()
+        check_thread.join(timeout=1.0)
+        monitor.stop()
+
+    diagnostic_thread.join(timeout=1.0)
+    assert not diagnostic_thread.is_alive()
+    assert detailed_dumped.is_set()
+
+
+def test_process_engine_step_progress_requires_model_or_outputs(monkeypatch):
+    progress_monitor = FakeProgressMonitor()
+    queued_outputs: list[tuple[int, Any]] = []
+    sleep_calls: list[float] = []
+    engine = SimpleNamespace(
+        progress_monitor=progress_monitor,
+        output_queue=SimpleNamespace(put_nowait=queued_outputs.append),
+        post_step=lambda model_executed: None,
+        scheduler=SimpleNamespace(has_requests=lambda: True),
+        step_fn=lambda: ({}, False),
+    )
+
+    monkeypatch.setattr(engine_core_module.time, "sleep", sleep_calls.append)
+
+    assert not engine_core_module.EngineCoreProc._process_engine_step(engine)
+    assert progress_monitor.activities == [("engine_step", None)]
+    assert progress_monitor.progress == []
+    assert sleep_calls == [0.001]
+
+
+def test_dp_housekeeping_does_not_mask_stalled_local_request():
+    progress_monitor = FakeProgressMonitor()
+    loop_conditions = iter((True, False))
+
+    @contextmanager
+    def capture_iteration_details(_scheduler_output):
+        yield None
+
+    engine = SimpleNamespace(
+        enable_fault_tolerance=False,
+        _handle_shutdown=lambda: next(loop_conditions),
+        engines_running=True,
+        _process_input_queue=lambda: None,
+        _maybe_publish_request_counts=lambda: None,
+        eep_scaling_state=None,
+        _process_engine_step=lambda: False,
+        scheduler=SimpleNamespace(has_unfinished_requests=lambda: True),
+        model_executor=SimpleNamespace(is_sleeping=False),
+        capture_iteration_details=capture_iteration_details,
+        progress_monitor=progress_monitor,
+        execute_dummy_batch=lambda: None,
+        has_coordinator=True,
+        _has_global_unfinished_reqs=lambda _local_unfinished: True,
+    )
+
+    with pytest.raises(SystemExit):
+        engine_core_module.DPEngineCoreProc.run_busy_loop(engine)
+
+    assert progress_monitor.activities == [
+        ("execute_dummy_batch", None),
+        ("dp_global_sync", None),
+    ]
+    assert progress_monitor.progress == []
+
+
+def test_process_engine_step_records_output_progress():
+    progress_monitor = FakeProgressMonitor()
+    queued_outputs: list[tuple[int, Any]] = []
+    engine_outputs = EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id="req-1", new_token_ids=[1])]
+    )
+    engine = SimpleNamespace(
+        progress_monitor=progress_monitor,
+        output_queue=SimpleNamespace(put_nowait=queued_outputs.append),
+        post_step=lambda model_executed: None,
+        scheduler=SimpleNamespace(has_requests=lambda: True),
+        step_fn=lambda: ({0: engine_outputs}, False),
+    )
+
+    assert not engine_core_module.EngineCoreProc._process_engine_step(engine)
+    assert queued_outputs == [(0, engine_outputs)]
+    assert progress_monitor.activities == [("engine_step", None)]
+    assert progress_monitor.progress == [
+        (
+            "engine_step",
+            {
+                "has_pending_work": True,
+                "model_executed": False,
+                "num_outputs": 1,
+            },
+        )
+    ]
+
+
+def test_process_engine_step_disabled_monitor_skips_diagnostic_work():
+    def fail_has_requests() -> bool:
+        raise AssertionError("disabled monitor queried scheduler state")
+
+    engine = SimpleNamespace(
+        progress_monitor=None,
+        output_queue=SimpleNamespace(put_nowait=lambda _output: None),
+        post_step=lambda model_executed: None,
+        scheduler=SimpleNamespace(has_requests=fail_has_requests),
+        step_fn=lambda: ({}, True),
+    )
+
+    assert engine_core_module.EngineCoreProc._process_engine_step(engine)

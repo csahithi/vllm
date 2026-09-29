@@ -45,6 +45,7 @@ from vllm import envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.serve.utils.api_utils import log_version_and_model
 from vllm.logger import init_logger
+from vllm.logging_utils.dump_input import install_stack_trace_signal_handler
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -72,6 +73,8 @@ async def serve_grpc(args: argparse.Namespace):
     vllm_config = engine_args.create_engine_config(
         usage_context=UsageContext.OPENAI_API_SERVER,
     )
+
+    install_stack_trace_signal_handler("APIServer")
 
     # Create AsyncLLM
     async_llm = AsyncLLM.from_vllm_config(
