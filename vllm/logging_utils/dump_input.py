@@ -55,7 +55,7 @@ ENGINE_NO_PROGRESS_STAGE = "no_forward_progress"
 _SAFE_STACK_TRACE_SIGNAL_NAMES = ("SIGUSR1", "SIGUSR2")
 _engine_diagnostic_bundle_lock = threading.Lock()
 _stack_trace_signal_handler_lock = threading.Lock()
-_stack_trace_signal_handlers: dict[int, str] = {}
+_stack_trace_signal_handlers: dict[tuple[int, int], str] = {}
 _ENGINE_TIMEOUT_MODEL_CONFIG_FIELDS = (
     "dtype",
     "enforce_eager",
@@ -638,15 +638,17 @@ def install_stack_trace_signal_handler(process_name: str) -> bool:
         )
         return False
 
+    process_id = os.getpid()
+    handler_key = (process_id, signum)
     with _stack_trace_signal_handler_lock:
-        installed_process = _stack_trace_signal_handlers.get(signum)
+        installed_process = _stack_trace_signal_handlers.get(handler_key)
         if installed_process is not None:
             logger.debug(
                 "Stack trace signal handler for %s is already installed in "
                 "%s (pid=%d).",
                 signal_name,
                 installed_process,
-                os.getpid(),
+                process_id,
             )
             return True
 
@@ -654,7 +656,8 @@ def install_stack_trace_signal_handler(process_name: str) -> bool:
             existing_handler = signal.getsignal(signum)
             if existing_handler != signal.SIG_DFL:
                 logger.warning(
-                    "Ignoring %s=%r because %s already has a signal handler.",
+                    "Ignoring %s=%r because %s already has a signal handler "
+                    "visible to Python's signal module.",
                     STACK_TRACE_SIGNAL_ENV_VAR,
                     signal_value,
                     signal_name,
@@ -673,18 +676,18 @@ def install_stack_trace_signal_handler(process_name: str) -> bool:
                 STACK_TRACE_SIGNAL_ENV_VAR,
                 signal_value,
                 process_name,
-                os.getpid(),
+                process_id,
                 exc,
             )
             return False
 
-        _stack_trace_signal_handlers[signum] = process_name
+        _stack_trace_signal_handlers[handler_key] = process_name
 
     logger.info(
         "Installed stack trace signal handler for %s in %s (pid=%d).",
         signal_name,
         process_name,
-        os.getpid(),
+        process_id,
     )
     return True
 

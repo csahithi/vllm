@@ -53,14 +53,19 @@ If other strategies don't solve the problem, it's likely that the vLLM instance 
   so filesystem stalls cannot block later stderr diagnostics.
 - `export VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S=300` to dump engine progress,
   scheduler state, and Python stack traces when an engine operation is active or
-  scheduler work is pending but engine-loop operations stop completing. This is
-  an engine-hang diagnostic, not a request-latency monitor. It is disabled by
-  default and its Python monitor cannot run while another thread holds the GIL.
+  scheduler work is pending without observable forward progress. This reports a
+  possible stall, not necessarily a failure: expected external waits such as
+  remote KV transfers or delayed connector frees can also trigger it. Set the
+  timeout above expected external-work durations. It is disabled by default.
+  The monitor works for native waits that release the GIL, but cannot run during
+  a pure-Python or native-code stall that holds the GIL indefinitely.
 - `export VLLM_DEBUG_STACK_TRACE_SIGNAL=SIGUSR1` to install an on-demand Python
   stack trace handler in API server, engine core, and worker processes. Only
-  `SIGUSR1` and `SIGUSR2` are supported, and installation is refused if another
-  Python handler already owns the signal. Send the configured signal to each
-  vLLM process to dump all Python thread stacks into its stderr/log stream.
+  `SIGUSR1` and `SIGUSR2` are supported; reserve the configured signal for vLLM.
+  Installation refuses handlers visible through Python's `signal` module, but
+  cannot detect every C-level handler; notably, an existing `faulthandler`
+  registration may be replaced. Send the configured signal to each vLLM process
+  to dump all Python thread stacks into its stderr/log stream.
 - `export CUDA_LAUNCH_BLOCKING=1` to identify which CUDA kernel is causing the problem.
 - `export NCCL_DEBUG=TRACE` to turn on more logging for NCCL.
 - `export VLLM_TRACE_FUNCTION=1` to record all function calls for inspection in the log files to tell which function crashes or hangs. (WARNING: This flag will slow down the token generation by **over 100x**. Do not use unless absolutely needed.)

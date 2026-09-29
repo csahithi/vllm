@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
@@ -193,7 +194,11 @@ class FakeProgressMonitor:
         self.record_progress("idle", {"has_work": False})
 
 
-def clear_stack_trace_signal_handler_state():
+@pytest.fixture(autouse=True)
+def reset_stack_trace_signal_handler_state() -> Iterator[None]:
+    with dump_input._stack_trace_signal_handler_lock:
+        dump_input._stack_trace_signal_handlers.clear()
+    yield
     with dump_input._stack_trace_signal_handler_lock:
         dump_input._stack_trace_signal_handlers.clear()
 
@@ -2123,7 +2128,6 @@ def test_install_stack_trace_signal_handler_registers_once(monkeypatch):
             }
         )
 
-    clear_stack_trace_signal_handler_state()
     monkeypatch.setattr(dump_input.signal, "SIGUSR1", 10, raising=False)
     monkeypatch.setattr(
         dump_input.signal, "getsignal", lambda _signum: dump_input.signal.SIG_DFL
@@ -2146,7 +2150,6 @@ def test_install_stack_trace_signal_handler_registers_once(monkeypatch):
             "signum": 10,
         }
     ]
-    clear_stack_trace_signal_handler_state()
 
 
 def test_install_stack_trace_signal_handler_rejects_unsafe_signal(monkeypatch):
@@ -2155,7 +2158,6 @@ def test_install_stack_trace_signal_handler_rejects_unsafe_signal(monkeypatch):
     def record_unexpected_register(*args: Any, **_kwargs: Any) -> None:
         registered.append(args)
 
-    clear_stack_trace_signal_handler_state()
     monkeypatch.setattr(
         dump_input.envs,
         "VLLM_DEBUG_STACK_TRACE_SIGNAL",
@@ -2170,13 +2172,11 @@ def test_install_stack_trace_signal_handler_rejects_unsafe_signal(monkeypatch):
 
     assert not dump_input.install_stack_trace_signal_handler("EngineCore")
     assert not registered
-    clear_stack_trace_signal_handler_state()
 
 
 def test_install_stack_trace_signal_handler_preserves_existing_handler(monkeypatch):
     registered: list[tuple[Any, ...]] = []
 
-    clear_stack_trace_signal_handler_state()
     monkeypatch.setattr(dump_input.signal, "SIGUSR1", 10, raising=False)
     monkeypatch.setattr(dump_input.signal, "getsignal", lambda _signum: object())
     monkeypatch.setattr(
@@ -2193,7 +2193,46 @@ def test_install_stack_trace_signal_handler_preserves_existing_handler(monkeypat
 
     assert not dump_input.install_stack_trace_signal_handler("EngineCore")
     assert not registered
-    clear_stack_trace_signal_handler_state()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork") or not hasattr(signal, "SIGUSR1"),
+    reason="requires fork and SIGUSR1",
+)
+def test_install_stack_trace_signal_handler_reregisters_after_fork():
+    script = """
+import os
+import signal
+from vllm.logging_utils import dump_input
+
+dump_input.envs.VLLM_DEBUG_STACK_TRACE_SIGNAL = "SIGUSR1"
+assert dump_input.install_stack_trace_signal_handler("APIServer")
+child_pid = os.fork()
+if child_pid == 0:
+    registrations = []
+    dump_input.faulthandler.register = (
+        lambda signum, **_kwargs: registrations.append(signum)
+    )
+    try:
+        assert dump_input.install_stack_trace_signal_handler("EngineCore")
+        assert registrations == [signal.SIGUSR1]
+    except BaseException:
+        os._exit(1)
+    os._exit(0)
+
+_, child_status = os.waitpid(child_pid, 0)
+assert os.waitstatus_to_exitcode(child_status) == 0
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="requires SIGUSR1")
