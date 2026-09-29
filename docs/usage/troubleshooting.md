@@ -44,13 +44,15 @@ If other strategies don't solve the problem, it's likely that the vLLM instance 
   source file paths. The watchdog requires a Python thread to run and cannot
   report native-code stalls that hold the Python GIL indefinitely.
 - `export VLLM_ENGINE_DIAGNOSTIC_DUMP_PATH=/local/path` to persist private,
-  per-rank diagnostic bundles for engine exceptions and slow-stage timeouts.
-  Bundles include engine context, bounded scheduler/request/KV-cache snapshots,
-  and timeout stack traces. Use fast local storage: exception-path writes wait
-  at most one second, bundles may contain sensitive request, configuration,
-  exception, and source-path data, and only the newest 20 finalized bundles per
-  rank are retained. Timeout persistence uses single-flight background writers
-  so filesystem stalls cannot block later stderr diagnostics.
+  per-rank diagnostic bundles for engine exceptions, slow-stage timeouts,
+  no-progress events, and unexpected child-process deaths. Bundles include
+  engine context, bounded scheduler/request/KV-cache snapshots, process exit
+  status, and timeout stack traces when available. Use fast local storage:
+  exception-path writes wait at most one second, bundles may contain sensitive
+  request, configuration, exception, and source-path data, and only the newest
+  20 finalized bundles per rank are retained. Timeout persistence uses
+  single-flight background writers so filesystem stalls cannot block later
+  stderr diagnostics.
 - `export VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S=300` to dump engine progress,
   scheduler state, and Python stack traces when an engine operation is active or
   scheduler work is pending without observable forward progress. This reports a

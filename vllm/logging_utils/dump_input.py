@@ -304,6 +304,93 @@ def dump_engine_no_progress(
         )
 
 
+def describe_process_exit(exitcode: int | None) -> dict[str, Any]:
+    """Return structured context for a child process exit status."""
+    if exitcode is None:
+        return {
+            "exit_code": None,
+            "signal_name": None,
+            "signal_number": None,
+            "status": "unknown",
+        }
+    if exitcode < 0:
+        signal_number = -exitcode
+        return {
+            "exit_code": exitcode,
+            "signal_name": _format_signal_name(signal_number),
+            "signal_number": signal_number,
+            "status": "signal",
+        }
+    return {
+        "exit_code": exitcode,
+        "signal_name": None,
+        "signal_number": None,
+        "status": "clean_exit" if exitcode == 0 else "exit_code",
+    }
+
+
+def format_process_exit(exitcode: int | None) -> str:
+    exit_status = describe_process_exit(exitcode)
+    if exit_status["status"] == "signal":
+        return f"signal {exit_status['signal_name']} ({exit_status['signal_number']})"
+    if exitcode is None:
+        return "unknown exit status"
+    return f"exit code {exitcode}"
+
+
+def dump_process_death_diagnostics(
+    config: VllmConfig,
+    *,
+    process_kind: str,
+    process_name: str,
+    pid: int | None,
+    exitcode: int | None,
+    details: dict[str, Any] | None = None,
+) -> Path | None:
+    process_death = {
+        "details": details or {},
+        "pid": pid,
+        "process_kind": process_kind,
+        "process_name": process_name,
+        **describe_process_exit(exitcode),
+    }
+    try:
+        logger.error(
+            "V1 %s process %s (pid=%s) died unexpectedly with %s.",
+            process_kind,
+            process_name,
+            pid,
+            format_process_exit(exitcode),
+        )
+        dump_root = _engine_diagnostic_dump_root(config)
+        if dump_root is None:
+            return None
+
+        try:
+            config_summary = _make_engine_config_summary(config)
+        except Exception:
+            logger.exception("Failed to prepare engine diagnostic config summary")
+            config_summary = {"summary_unavailable": True}
+
+        return _write_engine_diagnostic_bundle_with_timeout(
+            reason="process_death",
+            config=config,
+            dump_root=dump_root,
+            config_summary=config_summary,
+            scheduler_output_summary=None,
+            scheduler_queue_summary=None,
+            scheduler_output_text=None,
+            scheduler_stats_text=None,
+            stage=process_kind,
+            timeout_s=None,
+            error=None,
+            extra_context={"process_death": process_death},
+        )
+    except Exception:
+        logger.exception("Failed to write process-death diagnostic bundle")
+        return None
+
+
 class EngineCoreProgressMonitor:
     """Tracks EngineCore activity and dumps diagnostics on no progress."""
 
@@ -1204,6 +1291,7 @@ def _write_engine_diagnostic_bundle_with_timeout(
     error: Exception | None,
     scheduler_snapshot: dict[str, Any] | None = None,
     scheduler_snapshot_fn: Callable[[], dict[str, Any] | None] | None = None,
+    extra_context: dict[str, Any] | None = None,
 ) -> Path | None:
     result: list[Path] = []
 
@@ -1240,6 +1328,7 @@ def _write_engine_diagnostic_bundle_with_timeout(
             timeout_s=timeout_s,
             error=error,
             scheduler_snapshot=captured_scheduler_snapshot,
+            extra_context=extra_context,
         )
         expected_files = ["context.json"]
         if captured_scheduler_snapshot is not None:
@@ -1285,6 +1374,7 @@ def _write_engine_diagnostic_bundle(
     error: Exception | None,
     scheduler_snapshot: dict[str, Any] | None = None,
     dump_root: Path | None = None,
+    extra_context: dict[str, Any] | None = None,
 ) -> Path | None:
     bundle_dir: Path | None = None
     try:
@@ -1329,6 +1419,8 @@ def _write_engine_diagnostic_bundle(
             "timeout_s": timeout_s,
             "vllm_version": VLLM_VERSION,
         }
+        if extra_context is not None:
+            context.update(extra_context)
         _write_engine_diagnostic_json(
             bundle_dir / "context.json",
             context,
