@@ -52,7 +52,8 @@ If other strategies don't solve the problem, it's likely that the vLLM instance 
   request, configuration, exception, and source-path data, and only the newest
   20 finalized bundles per rank are retained. Timeout persistence uses
   single-flight background writers so filesystem stalls cannot block later
-  stderr diagnostics.
+  stderr diagnostics. Process-death bundles use the reporting manager's
+  diagnostic directory; the `process_death` field identifies the failed child.
 - `export VLLM_ENGINE_NO_PROGRESS_TIMEOUT_S=300` to dump engine progress,
   scheduler state, and Python stack traces when an engine operation is active or
   scheduler work is pending without observable forward progress. This reports a

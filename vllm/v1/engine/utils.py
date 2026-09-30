@@ -33,7 +33,12 @@ from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor
 from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
-from vllm.v1.utils import _SubprocessWrapper, get_engine_client_zmq_addr, shutdown
+from vllm.v1.utils import (
+    _SubprocessWrapper,
+    get_engine_client_zmq_addr,
+    shutdown,
+    wait_for_process_exit_status,
+)
 
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
@@ -262,10 +267,19 @@ class CoreEngineProcManager:
         while sentinels and not self.manager_stopped.is_set():
             died_sentinels = connection.wait(sentinels, timeout=1)
 
-            for sentinel in died_sentinels:
-                proc = sentinel_to_proc.pop(cast(int, sentinel))
+            if died_sentinels:
+                if self.manager_stopped.is_set():
+                    break
+                died_procs = [
+                    sentinel_to_proc[cast(int, sentinel)] for sentinel in died_sentinels
+                ]
+                wait_for_process_exit_status(died_procs)
+                proc = next(
+                    (proc for proc in died_procs if proc.exitcode not in (None, 0)),
+                    died_procs[0],
+                )
                 exitcode = proc.exitcode
-                if exitcode != 0 and not self.manager_stopped.is_set():
+                if not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
                     dump_process_death_diagnostics(
                         self.vllm_config,
@@ -278,7 +292,6 @@ class CoreEngineProcManager:
                             "local_engine_count": len(self.processes),
                         },
                     )
-            if died_sentinels:
                 break
 
         self.shutdown()
@@ -1020,9 +1033,23 @@ class CoreEngineActorManager:
                     continue
                 try:
                     ray.get(actor_ref)
-                except ray.exceptions.RayActorError:
-                    self.failed_proc_name = f"Actor {actor_ref}"
-                    unexpected_failure = True
+                except ray.exceptions.RayError as exc:
+                    failure = type(exc).__name__
+                else:
+                    failure = "run() returned"
+                # Shutdown or scale-down can start while retrieving the result.
+                if self.manager_stopped.is_set():
+                    break
+                if actor_ref not in self.get_run_refs():
+                    continue
+                self.failed_proc_name = f"Actor {actor_ref}"
+                logger.error(
+                    "Engine core actor %s stopped unexpectedly (%s).",
+                    actor_ref,
+                    failure,
+                )
+                unexpected_failure = True
+                break
 
             if unexpected_failure:
                 break

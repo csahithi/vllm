@@ -3,6 +3,7 @@
 
 import os
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -110,6 +111,68 @@ def test_background_resources_passes_worker_shutdown_timeout(
     resources = BackgroundResources(ctx=None, engine_manager=engine_manager)
     resources()
     engine_manager.shutdown.assert_called_once_with(timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "during_wait"),
+    [
+        ("task_error", False),
+        ("actor_error", False),
+        ("returned", False),
+        ("shutdown", True),
+        ("shutdown", False),
+        ("scale_down", True),
+        ("scale_down", False),
+    ],
+)
+def test_actor_monitor_reports_only_unexpected_completions(
+    monkeypatch: pytest.MonkeyPatch, outcome: str, during_wait: bool
+) -> None:
+    actor_ref = "engine-run-ref"
+    manager = object.__new__(CoreEngineActorManager)
+    manager.manager_stopped = threading.Event()
+    manager.failed_proc_name = None
+    manager.run_refs = [actor_ref]
+    shutdown = Mock()
+    monkeypatch.setattr(manager, "shutdown", shutdown)
+
+    def finish_run():
+        if outcome == "shutdown":
+            manager.manager_stopped.set()
+        elif outcome == "scale_down":
+            manager.run_refs.clear()
+
+    def wait_for_run(*args, **kwargs):
+        assert wait.call_count == 1, "completed run must not be polled repeatedly"
+        if during_wait:
+            finish_run()
+        return [actor_ref], []
+
+    def get_run_result(ref):
+        assert ref == actor_ref
+        if not during_wait:
+            finish_run()
+        if outcome == "task_error":
+            raise ray.exceptions.RayTaskError("run", "", RuntimeError("engine failed"))
+        if outcome == "actor_error":
+            raise ray.exceptions.RayActorError()
+
+    wait = Mock(side_effect=wait_for_run)
+    get = Mock(side_effect=get_run_result)
+    monkeypatch.setattr(ray, "wait", wait)
+    monkeypatch.setattr(ray, "get", get)
+
+    manager.monitor_engine_liveness()
+
+    expected_failure = (
+        None if outcome in ("shutdown", "scale_down") else f"Actor {actor_ref}"
+    )
+    assert manager.failed_proc_name == expected_failure
+    shutdown.assert_called_once_with()
+    if during_wait:
+        get.assert_not_called()
+    else:
+        get.assert_called_once_with(actor_ref)
 
 
 def _make_vllm_config() -> SimpleNamespace:

@@ -593,7 +593,10 @@ def wait_for_completion_or_failure(
                         f"died with exit code {proc.exitcode}"
                     )
                 if engine_manager and engine_manager.failed_proc_name is not None:
-                    finished_procs = engine_manager.finished_procs()
+                    finished_procs_fn = getattr(engine_manager, "finished_procs", None)
+                    finished_procs = (
+                        finished_procs_fn() if callable(finished_procs_fn) else {}
+                    )
                     raise RuntimeError(
                         f"Engine core process {engine_manager.failed_proc_name} "
                         "died unexpectedly. Finished engine processes: "
@@ -605,6 +608,24 @@ def wait_for_completion_or_failure(
     except Exception as e:
         logger.exception("Exception occurred while running API servers: %s", str(e))
         raise
+
+
+def wait_for_process_exit_status(
+    procs: Sequence[BaseProcess], timeout_s: float = 0.5
+) -> None:
+    """Poll notified processes' exit status within one shared retry budget."""
+    # Sentinel readiness can precede waitpid status availability. Avoid join(),
+    # which can block in waitpid even after the sentinel becomes readable.
+    deadline = time.monotonic() + timeout_s
+    pending = list(procs)
+    while pending:
+        pending = [proc for proc in pending if proc.exitcode is None]
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.001, remaining))
 
 
 # Note(rob): shutdown function cannot be a bound method,

@@ -74,6 +74,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.utils import wait_for_process_exit_status
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -315,7 +316,18 @@ class MultiprocExecutor(Executor):
                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
                 return
             _self.is_failed = True
-            worker = sentinel_to_worker[died[0]]
+            died_workers = [sentinel_to_worker[sentinel] for sentinel in died]
+            wait_for_process_exit_status([worker.proc for worker in died_workers])
+            if getattr(_self, "shutting_down", False):
+                return
+            worker = next(
+                (
+                    worker
+                    for worker in died_workers
+                    if worker.proc.exitcode not in (None, 0)
+                ),
+                died_workers[0],
+            )
             proc = worker.proc
             dump_process_death_diagnostics(
                 _self.vllm_config,

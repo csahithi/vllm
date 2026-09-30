@@ -22,8 +22,10 @@ import pytest
 
 import vllm.v1.core.sched.scheduler as scheduler_module
 import vllm.v1.engine.core as engine_core_module
+import vllm.v1.engine.core_client as core_client_module
 import vllm.v1.engine.utils as engine_utils
 import vllm.v1.executor.multiproc_executor as multiproc_executor_module
+import vllm.v1.utils as v1_utils
 from vllm.config import ModelConfig, SpeculativeConfig, VllmConfig
 from vllm.logging_utils import dump_input
 from vllm.sampling_params import SamplingParams
@@ -204,11 +206,20 @@ class FakeProc:
         pid: int,
         exitcode: int | None,
         sentinel: int,
+        pending_exitcode_reads: int = 0,
     ) -> None:
         self.name = name
         self.pid = pid
-        self.exitcode = exitcode
+        self._exitcode = exitcode
+        self._pending_exitcode_reads = pending_exitcode_reads
         self.sentinel = sentinel
+
+    @property
+    def exitcode(self) -> int | None:
+        if self._pending_exitcode_reads:
+            self._pending_exitcode_reads -= 1
+            return None
+        return self._exitcode
 
 
 @pytest.fixture(autouse=True)
@@ -2855,6 +2866,32 @@ def test_describe_process_exit_identifies_signal_exit():
     )
 
 
+def test_process_exit_status_retry_has_one_shared_budget(monkeypatch):
+    """Unavailable status must not indefinitely delay failure cleanup."""
+    elapsed = 0.0
+    budget = 0.0025
+    procs = [
+        FakeProc(f"worker-{i}", pid=i + 1, exitcode=None, sentinel=i) for i in range(3)
+    ]
+
+    def advance_clock(delay):
+        nonlocal elapsed
+        assert 0 < delay <= 0.001
+        elapsed += delay
+        assert elapsed <= budget
+
+    monkeypatch.setattr(
+        v1_utils,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed, sleep=advance_clock),
+    )
+
+    v1_utils.wait_for_process_exit_status(cast(Any, procs), timeout_s=budget)
+
+    assert elapsed == pytest.approx(budget)
+    assert all(proc.exitcode is None for proc in procs)
+
+
 def test_process_death_diagnostics_writes_bundle(tmp_path, monkeypatch):
     signum = int(signal.SIGTERM)
     config = enable_engine_diagnostic_bundles(monkeypatch, tmp_path)
@@ -2885,22 +2922,27 @@ def test_process_death_diagnostics_writes_bundle(tmp_path, monkeypatch):
         "signal_number": signum,
         "status": "signal",
     }
-    manifest = json.loads(
-        (bundle_dir / "manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["complete"]
 
 
-def test_core_engine_proc_manager_dumps_failed_process(monkeypatch):
+def test_core_engine_proc_manager_dumps_one_bundle_for_failed_processes(monkeypatch):
     signum = int(signal.SIGTERM)
     proc = FakeProc(
         "EngineCore",
         pid=1234,
-        exitcode=-signum,
+        exitcode=0,
         sentinel=17,
     )
+    other_proc = FakeProc(
+        "EngineCore_DP1",
+        pid=1235,
+        exitcode=-signum,
+        sentinel=18,
+        pending_exitcode_reads=1,
+    )
     manager = cast(Any, object.__new__(engine_utils.CoreEngineProcManager))
-    manager.processes = [proc]
+    manager.processes = [proc, other_proc]
     manager.manager_stopped = SimpleNamespace(is_set=lambda: False)
     manager.failed_proc_name = None
     manager.vllm_config = SimpleNamespace()
@@ -2914,7 +2956,7 @@ def test_core_engine_proc_manager_dumps_failed_process(monkeypatch):
     monkeypatch.setattr(
         engine_utils.connection,
         "wait",
-        lambda sentinels, timeout: [proc.sentinel],
+        lambda sentinels, timeout: [proc.sentinel, other_proc.sentinel],
     )
     monkeypatch.setattr(
         engine_utils,
@@ -2924,33 +2966,114 @@ def test_core_engine_proc_manager_dumps_failed_process(monkeypatch):
 
     engine_utils.CoreEngineProcManager.monitor_engine_liveness(manager)
 
-    assert manager.failed_proc_name == "EngineCore"
+    assert manager.failed_proc_name == "EngineCore_DP1"
     assert shutdown_calls == [None]
     assert diagnostics == [
         {
             "process_kind": "engine_core",
-            "process_name": "EngineCore",
-            "pid": 1234,
+            "process_name": "EngineCore_DP1",
+            "pid": 1235,
             "exitcode": -signum,
             "details": {
-                "finished_processes": {"EngineCore": -signum},
-                "local_engine_count": 1,
+                "finished_processes": {
+                    "EngineCore": 0,
+                    "EngineCore_DP1": -signum,
+                },
+                "local_engine_count": 2,
             },
         }
     ]
 
 
+def test_core_engine_proc_manager_dumps_unexpected_clean_exit(monkeypatch):
+    proc = FakeProc("EngineCore", pid=1234, exitcode=0, sentinel=17)
+    manager = cast(Any, object.__new__(engine_utils.CoreEngineProcManager))
+    manager.processes = [proc]
+    manager.manager_stopped = SimpleNamespace(is_set=lambda: False)
+    manager.failed_proc_name = None
+    manager.vllm_config = SimpleNamespace()
+    manager.shutdown = lambda timeout=None: None
+    diagnostics: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        engine_utils.connection,
+        "wait",
+        lambda sentinels, timeout: [proc.sentinel],
+    )
+    monkeypatch.setattr(
+        engine_utils,
+        "dump_process_death_diagnostics",
+        lambda config, **kwargs: diagnostics.append(kwargs),
+    )
+
+    engine_utils.CoreEngineProcManager.monitor_engine_liveness(manager)
+
+    assert manager.failed_proc_name == "EngineCore"
+    assert diagnostics[0]["exitcode"] == 0
+
+
+def test_core_engine_proc_manager_suppresses_expected_shutdown(monkeypatch):
+    proc = FakeProc("EngineCore", pid=1234, exitcode=0, sentinel=17)
+    stopped = threading.Event()
+    manager = cast(Any, object.__new__(engine_utils.CoreEngineProcManager))
+    manager.processes = [proc]
+    manager.manager_stopped = stopped
+    manager.failed_proc_name = None
+    manager.shutdown = lambda timeout=None: None
+
+    def stop_while_waiting(sentinels, timeout):
+        stopped.set()
+        return [proc.sentinel]
+
+    monkeypatch.setattr(engine_utils.connection, "wait", stop_while_waiting)
+    monkeypatch.setattr(
+        engine_utils,
+        "dump_process_death_diagnostics",
+        lambda *args, **kwargs: pytest.fail("unexpected diagnostic"),
+    )
+
+    engine_utils.CoreEngineProcManager.monitor_engine_liveness(manager)
+
+    assert manager.failed_proc_name is None
+
+
+def test_process_death_diagnostics_failure_is_fail_open(monkeypatch):
+    def fail_dump_root(config):
+        raise RuntimeError("diagnostic path failure")
+
+    monkeypatch.setattr(dump_input, "_engine_diagnostic_dump_root", fail_dump_root)
+
+    assert (
+        dump_input.dump_process_death_diagnostics(
+            SimpleNamespace(),
+            process_kind="worker",
+            process_name="WorkerProc-0",
+            pid=1234,
+            exitcode=1,
+        )
+        is None
+    )
+
+
 def test_multiproc_worker_monitor_dumps_failed_worker(monkeypatch):
     signum = int(signal.SIGTERM)
+    clean_proc = FakeProc(
+        "WorkerProc-1",
+        pid=2344,
+        exitcode=0,
+        sentinel=28,
+    )
     proc = FakeProc(
         "WorkerProc-2",
         pid=2345,
         exitcode=-signum,
         sentinel=29,
+        pending_exitcode_reads=1,
     )
+    clean_worker = SimpleNamespace(proc=clean_proc, rank=1)
     worker = SimpleNamespace(proc=proc, rank=2)
     executor = cast(Any, object.__new__(multiproc_executor_module.MultiprocExecutor))
-    executor.workers = [worker]
+    executor.workers = [clean_worker, worker]
     executor.vllm_config = SimpleNamespace()
     executor.local_world_size = 4
     executor.world_size = 8
@@ -2968,7 +3091,7 @@ def test_multiproc_worker_monitor_dumps_failed_worker(monkeypatch):
     monkeypatch.setattr(
         multiproc_executor_module.multiprocessing.connection,
         "wait",
-        lambda sentinels: [proc.sentinel],
+        lambda sentinels: [clean_proc.sentinel, proc.sentinel],
     )
     monkeypatch.setattr(
         multiproc_executor_module,
@@ -2991,10 +3114,93 @@ def test_multiproc_worker_monitor_dumps_failed_worker(monkeypatch):
             "pid": 2345,
             "exitcode": -signum,
             "details": {
-                "finished_workers": {2: -signum},
+                "finished_workers": {1: 0, 2: -signum},
                 "local_world_size": 4,
                 "rank": 2,
                 "world_size": 8,
             },
         }
     ]
+
+
+def test_multiproc_worker_monitor_suppresses_expected_shutdown(monkeypatch):
+    proc = FakeProc("WorkerProc-2", pid=2345, exitcode=0, sentinel=29)
+    worker = SimpleNamespace(proc=proc, rank=2)
+    executor = cast(Any, object.__new__(multiproc_executor_module.MultiprocExecutor))
+    executor.workers = [worker]
+    executor.shutting_down = True
+    executor.is_failed = False
+
+    monkeypatch.setattr(
+        multiproc_executor_module.multiprocessing.connection,
+        "wait",
+        lambda sentinels: [proc.sentinel],
+    )
+    monkeypatch.setattr(
+        multiproc_executor_module,
+        "dump_process_death_diagnostics",
+        lambda *args, **kwargs: pytest.fail("unexpected diagnostic"),
+    )
+
+    multiproc_executor_module.MultiprocExecutor.start_worker_monitor(
+        executor, inline=True
+    )
+
+    assert not executor.is_failed
+
+
+def test_mp_client_monitor_supports_actor_manager_without_finished_procs(
+    monkeypatch,
+):
+    class ImmediateThread:
+        def __init__(self, *, target, **kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    manager = SimpleNamespace(
+        failed_proc_name="Actor actor-id",
+        monitor_engine_liveness=lambda: None,
+    )
+    client = object.__new__(core_client_module.MPClient)
+    client.resources = SimpleNamespace(engine_manager=manager, engine_dead=False)
+    client._finalizer = SimpleNamespace(alive=True)
+    shutdown_calls: list[bool] = []
+    client.shutdown = lambda: shutdown_calls.append(True)
+    monkeypatch.setattr(core_client_module, "Thread", ImmediateThread)
+
+    core_client_module.MPClient.start_engine_core_monitor(client)
+
+    assert client.resources.engine_dead
+    assert shutdown_calls == [True]
+
+
+def test_wait_for_completion_supports_actor_manager_without_finished_procs(
+    monkeypatch,
+):
+    class Endpoint:
+        def close(self):
+            pass
+
+    class ImmediateThread:
+        def __init__(self, *, target, **kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    recv, send = Endpoint(), Endpoint()
+    manager = SimpleNamespace(
+        failed_proc_name="Actor actor-id",
+        monitor_engine_liveness=lambda: None,
+    )
+    monkeypatch.setattr(v1_utils.connection, "Pipe", lambda duplex: (recv, send))
+    monkeypatch.setattr(v1_utils.connection, "wait", lambda sentinels: [recv])
+    monkeypatch.setattr(v1_utils.threading, "Thread", ImmediateThread)
+
+    with pytest.raises(RuntimeError, match="Actor actor-id"):
+        v1_utils.wait_for_completion_or_failure(
+            api_server_manager=SimpleNamespace(processes=[]),
+            engine_manager=manager,
+        )
