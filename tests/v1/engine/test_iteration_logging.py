@@ -3012,7 +3012,10 @@ def test_core_engine_proc_manager_dumps_unexpected_clean_exit(monkeypatch):
     assert diagnostics[0]["exitcode"] == 0
 
 
-def test_core_engine_proc_manager_suppresses_expected_shutdown(monkeypatch):
+@pytest.mark.parametrize("during_exit_status_wait", [False, True])
+def test_core_engine_proc_manager_suppresses_expected_shutdown(
+    monkeypatch, during_exit_status_wait
+):
     proc = FakeProc("EngineCore", pid=1234, exitcode=0, sentinel=17)
     stopped = threading.Event()
     manager = cast(Any, object.__new__(engine_utils.CoreEngineProcManager))
@@ -3022,10 +3025,14 @@ def test_core_engine_proc_manager_suppresses_expected_shutdown(monkeypatch):
     manager.shutdown = lambda timeout=None: None
 
     def stop_while_waiting(sentinels, timeout):
-        stopped.set()
+        if not during_exit_status_wait:
+            stopped.set()
         return [proc.sentinel]
 
     monkeypatch.setattr(engine_utils.connection, "wait", stop_while_waiting)
+    monkeypatch.setattr(
+        engine_utils, "wait_for_process_exit_status", lambda procs: stopped.set()
+    )
     monkeypatch.setattr(
         engine_utils,
         "dump_process_death_diagnostics",
@@ -3123,18 +3130,34 @@ def test_multiproc_worker_monitor_dumps_failed_worker(monkeypatch):
     ]
 
 
-def test_multiproc_worker_monitor_suppresses_expected_shutdown(monkeypatch):
+@pytest.mark.parametrize("during_exit_status_wait", [False, True])
+def test_multiproc_worker_monitor_suppresses_expected_shutdown(
+    monkeypatch, during_exit_status_wait
+):
     proc = FakeProc("WorkerProc-2", pid=2345, exitcode=0, sentinel=29)
     worker = SimpleNamespace(proc=proc, rank=2)
     executor = cast(Any, object.__new__(multiproc_executor_module.MultiprocExecutor))
     executor.workers = [worker]
-    executor.shutting_down = True
+    executor.shutting_down = not during_exit_status_wait
     executor.is_failed = False
+    shutdown_calls = []
+
+    def shutdown():
+        shutdown_calls.append(True)
+        executor.shutting_down = True
+
+    executor.shutdown = shutdown
+    executor.failure_callback = lambda: pytest.fail("unexpected failure callback")
 
     monkeypatch.setattr(
         multiproc_executor_module.multiprocessing.connection,
         "wait",
         lambda sentinels: [proc.sentinel],
+    )
+    monkeypatch.setattr(
+        multiproc_executor_module,
+        "wait_for_process_exit_status",
+        lambda procs: executor.shutdown(),
     )
     monkeypatch.setattr(
         multiproc_executor_module,
@@ -3146,7 +3169,10 @@ def test_multiproc_worker_monitor_suppresses_expected_shutdown(monkeypatch):
         executor, inline=True
     )
 
-    assert not executor.is_failed
+    assert executor.shutting_down
+    assert shutdown_calls == ([True] if during_exit_status_wait else [])
+    # Death detected before shutdown must still reject new work immediately.
+    assert executor.is_failed == during_exit_status_wait
 
 
 def test_mp_client_monitor_supports_actor_manager_without_finished_procs(
