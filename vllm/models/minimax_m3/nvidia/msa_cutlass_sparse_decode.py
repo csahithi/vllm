@@ -26,6 +26,7 @@ _MAX_DECODE_QUERY_LEN = 32
 # Kernel benchmarks put the CUTLASS crossover at 16 requests for TP1 and TP4.
 # NVFP4 has no Triton fallback, so it takes CUTLASS at every batch size.
 _MIN_CUTLASS_BATCH_SIZE = 16
+_Q8KV4_GQA_RATIOS = (8, 16)
 
 
 def is_nvfp4_kv_cache(kv_cache_dtype: str) -> bool:
@@ -86,7 +87,7 @@ def _update_runtime_metadata_kernel(
 class MSACutlassDecodePlanCache:
     """Reusable plans whose mutable tensors retain cudagraph-stable addresses."""
 
-    plans: dict[tuple[int, ...], Any] = field(init=False, default_factory=dict)
+    plans: dict[tuple[int | str, ...], Any] = field(init=False, default_factory=dict)
 
     def _build_plan(
         self,
@@ -100,28 +101,39 @@ class MSACutlassDecodePlanCache:
         num_kv_heads: int,
         page_size: int,
         topk_blocks: int,
+        kv_cache_dtype: str,
     ) -> Any:
         from vllm.third_party.fmha_sm100.api import fmha_sm100_plan
 
         qo_lens_cpu = torch.full((batch,), decode_query_len, dtype=torch.int32)
         kv_lens_cpu = initial_seq_lens_cpu
+        plan_kwargs: dict[str, Any] = {
+            "num_kv_heads": num_kv_heads,
+            "qo_offset": kv_lens_cpu - qo_lens_cpu,
+            "page_size": page_size,
+            "output_maxscore": False,
+            "kv_block_num": topk_blocks,
+            "causal": True,
+            "sparse_kernel_mode": "decode",
+            "use_fp8_kvcache": True,
+            "split_prefill_decode": False,
+            "device": device,
+        }
+        if is_nvfp4_kv_cache(kv_cache_dtype):
+            plan_kwargs.update(
+                decode_backend="q8kv4",
+                prefill_backend="cute_dsl",
+                kv_dtype="nvfp4",
+                block_scale_shift=3,
+            )
+        else:
+            plan_kwargs["decode_backend"] = "kv_mode3"
+
         plan = fmha_sm100_plan(
             qo_lens_cpu,
             kv_lens_cpu,
             num_q_heads,
-            num_kv_heads=num_kv_heads,
-            qo_offset=kv_lens_cpu - qo_lens_cpu,
-            page_size=page_size,
-            output_maxscore=False,
-            kv_block_num=topk_blocks,
-            causal=True,
-            sparse_kernel_mode="decode",
-            use_fp8_kvcache=True,
-            split_prefill_decode=False,
-            device=device,
-            # The Q8KV4 route keeps plan-time lengths and its own page offsets,
-            # which this cached plan does not refresh.
-            decode_backend="kv_mode3",
+            **plan_kwargs,
         )
 
         plan_info = plan[3]
@@ -141,6 +153,15 @@ class MSACutlassDecodePlanCache:
             )
         )
         plan_info["kv_page_indptr"].copy_(page_indptr)
+        q8kv4 = plan_info.get("q8kv4")
+        if q8kv4 is not None:
+            q8kv4["kv_indptr"].copy_(
+                torch.arange(
+                    batch + 1,
+                    dtype=torch.int32,
+                    device=device,
+                ).mul_(page_table_stride)
+            )
         return plan
 
     def prepare(
@@ -154,6 +175,7 @@ class MSACutlassDecodePlanCache:
         num_kv_heads: int,
         page_size: int,
         topk_blocks: int,
+        kv_cache_dtype: str,
     ) -> MSACutlassDecodeMetadata:
         batch = int(seq_lens.shape[0])
         if (
@@ -195,6 +217,7 @@ class MSACutlassDecodePlanCache:
             num_kv_heads,
             page_size,
             topk_blocks,
+            kv_cache_dtype,
         )
         plan = self.plans.get(key)
         if plan is None:
@@ -208,6 +231,7 @@ class MSACutlassDecodePlanCache:
                 num_kv_heads=num_kv_heads,
                 page_size=page_size,
                 topk_blocks=topk_blocks,
+                kv_cache_dtype=kv_cache_dtype,
             )
             self.plans[key] = plan
 
@@ -221,6 +245,9 @@ class MSACutlassDecodePlanCache:
             decode_query_len=decode_query_len,
             BLOCK_SIZE=128,
         )
+        q8kv4 = plan_info.get("q8kv4")
+        if q8kv4 is not None:
+            q8kv4["seq_lens"].copy_(seq_lens)
         return MSACutlassDecodeMetadata(
             plan=plan,
             page_table=block_table.view(-1),
@@ -246,11 +273,13 @@ def supports_cutlass_sparse_decode(
 ) -> bool:
     """Return whether static model geometry supports CUTLASS sparse decode."""
     nvfp4 = is_nvfp4_kv_cache(kv_cache_dtype)
+    gqa_ratio = num_q_heads // num_kv_heads if num_kv_heads > 0 else 0
     return (
         (decode_backend == "cutlass" or nvfp4)
         and current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
         and (kv_cache_dtype in ("fp8", "fp8_e4m3") or nvfp4)
+        and (not nvfp4 or gqa_ratio in _Q8KV4_GQA_RATIOS)
         and _supported_head_geometry(num_q_heads, num_kv_heads)
         and page_size == _PAGE_SIZE
         and topk_blocks == _TOPK
@@ -296,6 +325,7 @@ def prepare_decode_metadata(
     num_kv_heads: int,
     page_size: int,
     topk_blocks: int,
+    kv_cache_dtype: str = "fp8",
     plan_cache: MSACutlassDecodePlanCache | None = None,
 ) -> MSACutlassDecodeMetadata:
     """Prepare graph-stable runtime metadata for one sparse decode step."""
@@ -309,6 +339,7 @@ def prepare_decode_metadata(
         num_kv_heads=num_kv_heads,
         page_size=page_size,
         topk_blocks=topk_blocks,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 

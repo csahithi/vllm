@@ -4,7 +4,8 @@
 NVFP4 KV cache)."""
 
 import math
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -369,6 +370,94 @@ def test_msa_cutlass_plan_cache_keys_query_len(
     assert first.plan is repeated.plan
     assert different.plan is not first.plan
     assert built_query_lens == [1, 2]
+
+
+def test_msa_q8kv4_plan_uses_padded_page_rows_and_refreshes_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = 2
+    page_table_stride = 7
+    block_table = torch.zeros(
+        batch, page_table_stride, dtype=torch.int32, device="cuda"
+    )
+    seq_lens = torch.tensor([257, 513], dtype=torch.int32, device="cuda")
+    seq_lens_cpu = seq_lens.cpu()
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_fmha_sm100_plan(qo_lens, kv_lens, num_q_heads, **kwargs):
+        captured_kwargs.update(kwargs)
+        num_rows = batch * int(qo_lens[0])
+        return (
+            None,
+            None,
+            None,
+            {
+                "kv_page_indptr": torch.zeros(
+                    num_rows + 1, dtype=torch.int32, device="cuda"
+                ),
+                "kv_segment_lens": torch.empty(
+                    num_rows, dtype=torch.int32, device="cuda"
+                ),
+                "qo_offset": torch.empty(num_rows, dtype=torch.int32, device="cuda"),
+                "q8kv4": {
+                    "seq_lens": torch.zeros(batch, dtype=torch.int32, device="cuda"),
+                    "kv_indptr": torch.zeros(
+                        batch + 1, dtype=torch.int32, device="cuda"
+                    ),
+                },
+            },
+        )
+
+    package_name = "vllm.third_party.fmha_sm100"
+    api_name = f"{package_name}.api"
+    package = ModuleType(package_name)
+    package.__path__ = []  # type: ignore[attr-defined]
+    api = ModuleType(api_name)
+    api.fmha_sm100_plan = fake_fmha_sm100_plan  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, package_name, package)
+    monkeypatch.setitem(sys.modules, api_name, api)
+
+    plan_cache = MSACutlassDecodePlanCache()
+    metadata = prepare_decode_metadata(
+        block_table,
+        seq_lens,
+        seq_lens_cpu,
+        1,
+        num_q_heads=16,
+        num_kv_heads=1,
+        page_size=BLOCK_SIZE,
+        topk_blocks=TOPK,
+        kv_cache_dtype="nvfp4",
+        plan_cache=plan_cache,
+    )
+    q8kv4 = metadata.plan[3]["q8kv4"]
+
+    assert captured_kwargs["decode_backend"] == "q8kv4"
+    assert captured_kwargs["prefill_backend"] == "cute_dsl"
+    assert captured_kwargs["kv_dtype"] == "nvfp4"
+    assert captured_kwargs["block_scale_shift"] == 3
+    torch.testing.assert_close(q8kv4["seq_lens"], seq_lens)
+    torch.testing.assert_close(
+        q8kv4["kv_indptr"],
+        torch.tensor([0, 7, 14], dtype=torch.int32, device="cuda"),
+    )
+
+    updated_seq_lens = torch.tensor([385, 641], dtype=torch.int32, device="cuda")
+    repeated = prepare_decode_metadata(
+        block_table,
+        updated_seq_lens,
+        updated_seq_lens.cpu(),
+        1,
+        num_q_heads=16,
+        num_kv_heads=1,
+        page_size=BLOCK_SIZE,
+        topk_blocks=TOPK,
+        kv_cache_dtype="nvfp4",
+        plan_cache=plan_cache,
+    )
+
+    assert repeated.plan is metadata.plan
+    torch.testing.assert_close(q8kv4["seq_lens"], updated_seq_lens)
 
 
 def test_query_fp8_stays_valid_when_cutlass_plan_appears_on_replay(
@@ -867,6 +956,7 @@ def test_msa_cutlass_decode_nvfp4_matches_triton_on_dequantized_cache(
         num_kv_heads=num_kv_heads,
         page_size=BLOCK_SIZE,
         topk_blocks=TOPK,
+        kv_cache_dtype="nvfp4",
     )
     actual = torch.zeros_like(query)
 

@@ -171,6 +171,7 @@ class MiniMaxM3SparseMSAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
                 num_kv_heads=self.num_kv_heads,
                 page_size=SPARSE_BLOCK_SIZE,
                 topk_blocks=self.topk_blocks,
+                kv_cache_dtype=self.kv_cache_dtype,
                 plan_cache=self.msa_cutlass_plan_cache,
             )
         metadata.decode = MiniMaxM3SparseMSADecodeMetadata(
