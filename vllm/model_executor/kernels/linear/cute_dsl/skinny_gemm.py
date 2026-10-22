@@ -120,6 +120,11 @@ class ShapeDynamicSkinnyGemm:
         config: SkinnyGemmConfig,
         has_residual: bool,
     ) -> None:
+        key = (dtype, config, has_residual)
+        # CUDA graph capture can JIT a config before the warmup reaches it.
+        if key in self._compiled:
+            return
+
         import cutlass.cute as cute
         from quack.compile_utils import make_fake_tensor
 
@@ -155,7 +160,7 @@ class ShapeDynamicSkinnyGemm:
             use_pdl=self._use_pdl(),
             static_k=config.static_k,
         )
-        self._compiled[(dtype, config, has_residual)] = cute.compile(
+        self._compiled[key] = cute.compile(
             kernel,
             a,
             b,
