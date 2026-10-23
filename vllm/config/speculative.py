@@ -706,6 +706,9 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Dots3NoteMTPModel"]}
             )
+        if hf_config.model_type == "glm_moe_dsa":
+            # GLM routes in fp32; keep it once the model_type below is rewritten.
+            hf_config.update({"moe_router_dtype": "float32"})
         if hf_config.model_type in (
             "deepseek_v3",
             "deepseek_v32",
