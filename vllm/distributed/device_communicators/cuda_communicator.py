@@ -494,7 +494,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return super().all_gather(input_, dim)
 
         # On ROCm, the base-class all_gather (all_gather_into_tensor) is faster
-        # than the manual pynccl + torch.empty + movedim + reshape path below,
+        # than the manual pynccl + torch.empty + cat relayout path below,
         # which adds a per-call output allocation and (for dim != 0) an extra
         # copy on every step. This is on the hot path for TP forward passes, so
         # keep ROCm on the base-class collective to avoid a decode regression.
@@ -507,12 +507,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             output_size, dtype=input_.dtype, device=input_.device
         )
         pynccl_comm.all_gather(output_tensor, input_.contiguous())
-        output_tensor = output_tensor.reshape((self.world_size,) + input_size)
-        output_tensor = output_tensor.movedim(0, dim)
-        return output_tensor.reshape(
-            input_size[:dim]
-            + (self.world_size * input_size[dim],)
-            + input_size[dim + 1 :]
+        if all(s == 1 for s in input_size[:dim]):
+            # The rank-major buffer is already laid out along `dim` (dim 0, or
+            # e.g. a single-token [1, N] gather on dim=-1), so this is a free view.
+            return output_tensor.view(
+                input_size[:dim]
+                + (self.world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
+        # Concatenating the contiguous per-rank chunks is much faster than
+        # materializing movedim(0, dim) with a strided copy.
+        return torch.cat(
+            output_tensor.reshape((self.world_size,) + input_size).unbind(0), dim=dim
         )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):

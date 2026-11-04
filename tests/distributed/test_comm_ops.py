@@ -5,6 +5,7 @@
 Run `pytest tests/distributed/test_comm_ops.py`.
 """
 
+import math
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -107,22 +108,23 @@ def all_gather_test_worker(
     torch.accelerator.set_device_index(device)
     init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
     num_dimensions = 3
-    tensor_size = list(range(2, num_dimensions + 2))
-    total_size = 1
-    for s in tensor_size:
-        total_size *= s
-    for all_gather_dimension in range(num_dimensions):
-        all_tensors = [
-            torch.arange(total_size, dtype=torch.float32, device="cuda").reshape(
-                tensor_size
-            )
-            * (r + 1)
-            for r in range(tp_size)
-        ]
-        expected = torch.cat(all_tensors, dim=all_gather_dimension)
-        t = all_tensors[rank % tp_size]
-        t = tensor_model_parallel_all_gather(t, all_gather_dimension)
-        torch.testing.assert_close(t, expected)
+    # [1, 3, 4] takes the zero-copy path for dim 1; [2, 1, 4] gathers a
+    # size-1 dim, which used to come back as a strided view.
+    for tensor_size in ([2, 3, 4], [1, 3, 4], [2, 1, 4]):
+        total_size = math.prod(tensor_size)
+        for all_gather_dimension in range(-num_dimensions, num_dimensions):
+            all_tensors = [
+                torch.arange(total_size, dtype=torch.float32, device="cuda").reshape(
+                    tensor_size
+                )
+                * (r + 1)
+                for r in range(tp_size)
+            ]
+            expected = torch.cat(all_tensors, dim=all_gather_dimension)
+            t = all_tensors[rank % tp_size]
+            t = tensor_model_parallel_all_gather(t, all_gather_dimension)
+            torch.testing.assert_close(t, expected)
+            assert t.is_contiguous()
 
 
 @ray.remote(num_gpus=1, max_calls=1)

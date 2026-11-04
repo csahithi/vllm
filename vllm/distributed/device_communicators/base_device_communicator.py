@@ -281,15 +281,19 @@ class DeviceCommunicatorBase:
         )
         # All-gather.
         dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
-        # Reshape
-        output_tensor = output_tensor.reshape((self.world_size,) + input_size)
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim]
-            + (self.world_size * input_size[dim],)
-            + input_size[dim + 1 :]
+        if all(s == 1 for s in input_size[:dim]):
+            # The rank-major buffer is already laid out along `dim` (dim 0, or
+            # e.g. a single-token [1, N] gather on dim=-1), so this is a free view.
+            return output_tensor.view(
+                input_size[:dim]
+                + (self.world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
+        # Concatenating the contiguous per-rank chunks is much faster than
+        # materializing movedim(0, dim) with a strided copy.
+        return torch.cat(
+            output_tensor.reshape((self.world_size,) + input_size).unbind(0), dim=dim
         )
-        return output_tensor
 
     def all_gatherv(
         self,
