@@ -468,16 +468,19 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         )
 
 
+# The shape arguments (num_words, mask_row_stride, max_q_len, total_q) are
+# runtime values: as constexprs, every new prompt or chunk length would compile
+# a new kernel on the critical path.
 @triton.jit
 def _scatter_topk_kernel(
     mask_ptr,
     topk_ptr,
     cu_q_lens_ptr,
-    num_words: tl.constexpr,
-    mask_row_stride: tl.constexpr,
+    num_words,
+    mask_row_stride,
     num_topk: tl.constexpr,
     topk_stride: tl.constexpr,
-    max_q_len: tl.constexpr,
+    max_q_len,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_WORDS: tl.constexpr,
 ):
@@ -513,11 +516,11 @@ def _scatter_topk_kernel(
 def _scatter_topk_single_req_kernel(
     mask_ptr,
     topk_ptr,
-    num_words: tl.constexpr,
-    mask_row_stride: tl.constexpr,
+    num_words,
+    mask_row_stride,
     num_topk: tl.constexpr,
     topk_stride: tl.constexpr,
-    total_q: tl.constexpr,
+    total_q,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_WORDS: tl.constexpr,
 ):
