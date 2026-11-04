@@ -3,10 +3,12 @@
 
 import torch.nn as nn
 
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
 )
+from vllm.v1.worker.utils import AttentionGroup
 
 
 class MTPSpeculator(TargetDependentARSpeculator):
@@ -57,3 +59,18 @@ class MTPSpeculator(TargetDependentARSpeculator):
     def on_multi_step_decode_end(self, num_reqs: int) -> None:
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)
+
+    def _needs_draft_decode_metadata_update(self, group: AttentionGroup) -> bool:
+        # In reuse mode on_multi_step_decode_begin sets skip_topk on every MTP
+        # attention layer before capture and replay, so no draft decode step
+        # runs the indexer op, the only reader of the indexer's decode metadata.
+        # Compressed indexers (compress_ratio > 1) also rewrite
+        # metadata.slot_mapping, which is not private to the indexer op, so keep
+        # refreshing those.
+        if not self.share_mtp_topk_indices:
+            return True
+        builder = group.get_metadata_builder()
+        return not (
+            isinstance(builder, DeepseekV32IndexerMetadataBuilder)
+            and builder.compress_ratio == 1
+        )

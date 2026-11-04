@@ -748,7 +748,14 @@ class DraftModelSpeculator(BaseSpeculator):
             )
         for groups in self.attn_groups:
             for group in groups:
-                group.update_draft_decode_metadata(attn_metadata)
+                if self._needs_draft_decode_metadata_update(group):
+                    group.update_draft_decode_metadata(attn_metadata)
+
+    def _needs_draft_decode_metadata_update(self, group: AttentionGroup) -> bool:
+        """Whether draft decode steps read the group's metadata, so it must be
+        refreshed before each of them. Overridden by speculators whose decode
+        steps skip a group's consumers."""
+        return True
 
     def _map_kernel_block_tables(self) -> None:
         """Refresh the persistent kernel block tables a FULL graph reads."""

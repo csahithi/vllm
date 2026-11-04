@@ -19,11 +19,13 @@ from vllm.model_executor.models.mistral_large_3_eagle import (
 )
 from vllm.v1.attention.backends import flash_attn as flash_attn_module
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
@@ -715,3 +717,28 @@ def test_rebuilt_prefill_metadata_uses_target_batch_slots():
     assert target_slots.data_ptr() == speculator.block_tables.slot_mappings.data_ptr()
     assert target_slots.shape == (1, 6)
     assert slot_mappings["draft"].tolist() == list(range(6))
+
+
+@pytest.mark.parametrize(
+    ("share_mtp_topk_indices", "compress_ratio", "indexer_updated"),
+    [(True, 1, False), (False, 1, True), (True, 4, True)],
+)
+def test_mtp_skips_unread_indexer_draft_decode_metadata(
+    share_mtp_topk_indices, compress_ratio, indexer_updated
+):
+    """Draft decode steps that reuse step 0's top-k never run the indexer, so
+    its decode metadata is not refreshed between them, unless the refresh
+    also writes a compressed slot mapping."""
+    indexer_builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    indexer_builder.compress_ratio = compress_ratio
+    mla_group, indexer_group = Mock(), Mock()
+    indexer_group.get_metadata_builder.return_value = indexer_builder
+    speculator = object.__new__(MTPSpeculator)
+    speculator.share_mtp_topk_indices = share_mtp_topk_indices
+    speculator.block_tables = SimpleNamespace(cp_size=1)
+    speculator.attn_groups = [[mla_group, indexer_group]]
+
+    speculator._update_draft_decode_metadata({}, num_reqs=1)
+
+    mla_group.update_draft_decode_metadata.assert_called_once_with({})
+    assert indexer_group.update_draft_decode_metadata.called is indexer_updated
