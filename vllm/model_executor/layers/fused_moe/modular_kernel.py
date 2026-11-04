@@ -10,6 +10,7 @@ from typing import Any, final
 import torch
 
 import vllm.envs as envs
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -1742,6 +1743,69 @@ class FusedMoEKernel:
 
         self._post_init_setup()
 
+        # Optional second modular impl for large calls, sharing fused_experts
+        # (and so the weights). See set_large_batch_prepare_finalize.
+        self._large_batch_impl: FusedMoEKernelModularImpl | None = None
+        self._large_batch_threshold = 0
+
+    def set_large_batch_prepare_finalize(
+        self,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        threshold: int,
+    ) -> None:
+        """Run calls whose largest per-EP-rank token count exceeds
+        ``threshold`` through ``prepare_finalize``, with the same experts.
+
+        Everything read outside the MoE custom op (output_is_reduced(),
+        topk_indices_dtype(), shared-expert overlap) keeps coming from the
+        primary prepare/finalize, so the caller only pairs implementations
+        whose differences there do not change the result.
+        """
+        impl = self.impl
+        assert isinstance(impl, FusedMoEKernelModularImpl)
+        assert threshold > 0
+        assert (
+            prepare_finalize.supports_async() == impl.prepare_finalize.supports_async()
+        )
+        prepare_finalize.post_init_setup(impl.fused_experts)
+        assert (
+            prepare_finalize.activation_format == impl.fused_experts.activation_format()
+        )
+        self._large_batch_impl = FusedMoEKernelModularImpl(
+            prepare_finalize, impl.fused_experts
+        )
+        self._large_batch_threshold = threshold
+
+    def _select_modular_impl(self) -> FusedMoEKernelModularImpl:
+        impl = self.impl
+        assert isinstance(impl, FusedMoEKernelModularImpl)
+        large_impl = self._large_batch_impl
+        if large_impl is None:
+            return impl
+        if large_impl.fused_experts is not impl.fused_experts:
+            # The impl was replaced (e.g. by FusedMoEModularMethod after a
+            # weight reload): drop the large-batch path rather than running it
+            # with stale experts.
+            logger.warning_once(
+                "Hybrid MoE all2all disabled: the experts were replaced after "
+                "it was set up (e.g. by a weight reload), so every call now "
+                "uses %s.",
+                type(impl.prepare_finalize).__name__,
+            )
+            self._large_batch_impl = None
+            return impl
+        if not is_forward_context_available():
+            return impl
+        dp_metadata = get_forward_context().dp_metadata
+        # The per-EP-rank token counts the runner set for this call, which also
+        # size the one-sided dispatch. They derive from the DP-synced counts,
+        # so they are identical on every rank (and the padded graph size under
+        # CUDA graph capture and replay): all EP ranks take the same path.
+        sizes = None if dp_metadata is None else dp_metadata.local_sizes
+        if sizes is not None and max(sizes) > self._large_batch_threshold:
+            return large_impl
+        return impl
+
     @property
     def can_overlap_shared_experts(self) -> bool:
         if isinstance(self.impl, FusedMoEKernelModularImpl):
@@ -1840,8 +1904,7 @@ class FusedMoEKernel:
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
-        assert isinstance(self.impl, FusedMoEKernelModularImpl)
-        return self.impl.apply(
+        return self._select_modular_impl().apply(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,

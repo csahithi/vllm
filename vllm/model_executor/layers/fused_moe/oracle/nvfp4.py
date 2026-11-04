@@ -10,6 +10,7 @@ from vllm import envs
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    maybe_add_hybrid_all2all,
     maybe_make_prepare_finalize,
 )
 from vllm.model_executor.layers.fused_moe.config import (
@@ -696,5 +697,6 @@ def make_nvfp4_moe_kernel(
         prepare_finalize,
         experts,
     )
+    maybe_add_hybrid_all2all(kernel, moe_config)
 
     return kernel

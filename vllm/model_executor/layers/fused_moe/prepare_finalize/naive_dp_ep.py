@@ -6,7 +6,10 @@ from contextlib import contextmanager
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.distributed import get_ep_group
+from vllm.distributed import GroupCoordinator, get_ep_group
+from vllm.distributed.device_communicators.base_device_communicator import (
+    All2AllManagerBase,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -89,10 +92,14 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         self,
         is_sequence_parallel: bool = False,
         num_dispatchers: int = 1,
+        all2all_manager: All2AllManagerBase | None = None,
     ) -> None:
         super().__init__()
         self.is_sequence_parallel = is_sequence_parallel
         self._num_dispatchers = num_dispatchers
+        # Dispatch and combine through this manager instead of the EP group's
+        # own, e.g. the all-gather/reduce-scatter half of a hybrid all-to-all.
+        self._all2all_manager = all2all_manager
         # Set by FusedMoEWithLoRA.set_mapping() when LoRA is active. When
         # present, prepare() dispatches the per-token LoRA mapping alongside
         # hidden_states and writes the gathered result back to the context so
@@ -101,6 +108,11 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
 
     def set_lora_context(self, ctx) -> None:
         self._lora_context = ctx
+
+    def _comm(self) -> GroupCoordinator | All2AllManagerBase:
+        if self._all2all_manager is not None:
+            return self._all2all_manager
+        return get_ep_group()
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -124,7 +136,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor | None:
-        return get_ep_group().allocate_combine_input(
+        return self._comm().allocate_combine_input(
             shape,
             dtype,
             device,
@@ -216,7 +228,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             extra_tensors.append(local_token_lora_mapping)
 
         with self._comm_region():
-            res = get_ep_group().dispatch(
+            res = self._comm().dispatch(
                 a1q,
                 topk_weights,
                 topk_ids,
@@ -277,7 +289,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         )
 
         with self._comm_region():
-            get_ep_group().combine_into_output(
+            self._comm().combine_into_output(
                 out,
                 output,
                 is_sequence_parallel=self.is_sequence_parallel,

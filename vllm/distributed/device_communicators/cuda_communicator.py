@@ -23,7 +23,7 @@ from vllm.platforms import current_platform
 
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
-from .base_device_communicator import DeviceCommunicatorBase
+from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
 logger = init_logger(__name__)
 
@@ -205,6 +205,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
+        # All-gather/reduce-scatter manager for the large-batch half of the
+        # hybrid MoE all-to-all (VLLM_MOE_HYBRID_A2A_TOKENS).
+        self.hybrid_all2all_manager: All2AllManagerBase | None = None
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
@@ -285,6 +288,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .all2all import FlashInferNVLinkOneSidedManager
 
                 self.all2all_manager = FlashInferNVLinkOneSidedManager(self.cpu_group)
+                if envs.VLLM_MOE_HYBRID_A2A_TOKENS > 0:
+                    from .all2all import AgRsAll2AllManager
+
+                    # No workspace of its own: it runs on the DP (or, with
+                    # sequence-parallel MoE, EP) group's PyNccl communicator.
+                    self.hybrid_all2all_manager = AgRsAll2AllManager(
+                        self.cpu_group, tcp_store_group
+                    )
+                    logger.info(
+                        "Hybrid MoE all2all: created the allgather_reducescatter "
+                        "manager on EP rank %d (VLLM_MOE_HYBRID_A2A_TOKENS=%d).",
+                        self.rank_in_group,
+                        envs.VLLM_MOE_HYBRID_A2A_TOKENS,
+                    )
             elif self.all2all_backend == "passthrough":
                 from .all2all import PassThroughAll2AllManager
 
@@ -843,6 +860,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]
+        if self.hybrid_all2all_manager is not None:
+            self.hybrid_all2all_manager.destroy()
+            self.hybrid_all2all_manager = None
 
     def _can_use_aiter_ag_rs(self, sizes: list[int] | None) -> bool:
         """Whether the AITER custom AG/RS fast path may run for this collective.

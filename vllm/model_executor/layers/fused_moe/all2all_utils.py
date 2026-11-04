@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm.config import get_current_vllm_config
+import vllm.envs as envs
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import (
     GroupCoordinator,
     get_ep_group,
+    get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
@@ -18,10 +20,12 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEKernel,
     FusedMoEPrepareAndFinalize,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     BatchedPrepareAndFinalize,
+    MoEPrepareAndFinalizeNaiveDPEPModular,
     make_moe_prepare_and_finalize_naive_dp_ep,
     make_moe_prepare_and_finalize_no_dp_ep,
 )
@@ -484,3 +488,103 @@ def maybe_make_prepare_finalize(
         )
 
     return prepare_finalize
+
+
+def maybe_add_hybrid_all2all(kernel: FusedMoEKernel, moe: FusedMoEConfig) -> None:
+    """Add the large-batch half of the hybrid MoE all-to-all to ``kernel``.
+
+    With ``VLLM_MOE_HYBRID_A2A_TOKENS=N`` and flashinfer_nvlink_one_sided, MoE
+    calls whose largest per-EP-rank token count exceeds N (e.g. eager prefill)
+    dispatch with all-gather and combine with reduce-scatter instead. Both
+    paths share the experts object, so the weights are not duplicated, and
+    both quantize the activations with the same scales before sending them.
+    """
+    threshold = envs.VLLM_MOE_HYBRID_A2A_TOKENS
+    if threshold <= 0:
+        return
+    if (
+        not moe.use_fi_nvl_one_sided_kernels
+        or kernel.is_monolithic
+        # LoRA wires its token mapping into the primary prepare/finalize only.
+        or moe.is_lora_enabled
+    ):
+        logger.warning_once(
+            "VLLM_MOE_HYBRID_A2A_TOKENS needs modular experts without LoRA and "
+            "the flashinfer_nvlink_one_sided all2all backend; ignored for %s.",
+            type(kernel.fused_experts).__name__,
+        )
+        return
+    # The runner reads output_is_reduced() from the one-sided prepare/finalize
+    # outside the MoE op. AgRs differs there, which only feeds a TP all-reduce
+    # that is a no-op at TP=1 and skipped for sequence-parallel MoE.
+    if moe.dp_size == 1 or (
+        not moe.is_sequence_parallel and get_tensor_model_parallel_world_size() > 1
+    ):
+        logger.warning_once(
+            "VLLM_MOE_HYBRID_A2A_TOKENS needs DP with TP=1 or sequence-parallel "
+            "MoE; ignored."
+        )
+        return
+    # Both paths run this experts object, so it must also take the AgRs
+    # layout: every rank's tokens, rows with no local expert reduced as zeros.
+    parallel_config = moe.moe_parallel_config
+    ag_rs_config = replace(parallel_config, all2all_backend="allgather_reducescatter")
+    experts_cls = type(kernel.fused_experts)
+    if not experts_cls._supports_parallel_config(ag_rs_config):
+        logger.info_once(
+            "Hybrid MoE all2all: %s does not support allgather_reducescatter; "
+            "keeping flashinfer_nvlink_one_sided for all its calls.",
+            experts_cls.__name__,
+        )
+        return
+    device_communicator = get_ep_group().device_communicator
+    manager = getattr(device_communicator, "hybrid_all2all_manager", None)
+    if manager is None:
+        return
+    # AgRs dispatches and combines with PyNccl all_gatherv/reduce_scatterv on
+    # the group the manager picks (DP, or EP for sequence-parallel MoE).
+    comm_group = manager._get_comm_group(parallel_config.is_sequence_parallel)
+    pynccl_comm = getattr(comm_group.device_communicator, "pynccl_comm", None)
+    if envs.VLLM_DISABLE_PYNCCL or pynccl_comm is None or pynccl_comm.disabled:
+        logger.warning_once(
+            "VLLM_MOE_HYBRID_A2A_TOKENS needs PyNccl on the %s group and "
+            "VLLM_DISABLE_PYNCCL unset; ignored.",
+            comm_group.unique_name,
+        )
+        return
+    # Keep every CUDA graph-captured MoE call on the one-sided path: AgRs
+    # inside captured graphs is untested, and its symmetric-memory gathers
+    # would allocate during capture.
+    compilation_config = get_current_vllm_config().compilation_config
+    max_capture_size = compilation_config.max_cudagraph_capture_size or 0
+    if (
+        compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        and threshold < max_capture_size
+    ):
+        logger.warning_once(
+            "VLLM_MOE_HYBRID_A2A_TOKENS=%d is below max_cudagraph_capture_size; "
+            "raising it to %d so CUDA graph-captured MoE calls stay on "
+            "flashinfer_nvlink_one_sided (allgather_reducescatter inside "
+            "captured graphs is untested, and its symmetric-memory gathers "
+            "would allocate during capture).",
+            threshold,
+            max_capture_size,
+        )
+        threshold = max_capture_size
+
+    prepare_finalize = MoEPrepareAndFinalizeNaiveDPEPModular(
+        is_sequence_parallel=parallel_config.is_sequence_parallel,
+        num_dispatchers=manager.world_size,
+        all2all_manager=manager,
+    )
+    kernel.set_large_batch_prepare_finalize(prepare_finalize, threshold)
+    logger.info_once(
+        "Hybrid MoE all2all on EP rank %d: %s up to %d tokens per EP rank, %s "
+        "above. VLLM_MOE_HYBRID_A2A_TOKENS must be identical on every DP/EP "
+        "rank.",
+        parallel_config.ep_rank,
+        type(kernel.prepare_finalize).__name__,
+        threshold,
+        type(prepare_finalize).__name__,
+        scope="process",
+    )

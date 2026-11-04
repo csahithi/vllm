@@ -231,6 +231,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
+    VLLM_MOE_HYBRID_A2A_TOKENS: int = 0
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1898,6 +1899,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE", "0"))
     ),
+    # Hybrid MoE all-to-all for --all2all-backend flashinfer_nvlink_one_sided:
+    # MoE calls whose largest per-EP-rank token count exceeds this value use
+    # all-gather/reduce-scatter instead (e.g. large eager prefill steps),
+    # sharing the experts and their weights. 0 (default) disables it. With
+    # CUDA graphs, a value below max_cudagraph_capture_size is raised to it.
+    # Must be identical on every DP/EP rank: it is not checked across ranks,
+    # and ranks that disagree issue mismatched collectives and hang.
+    "VLLM_MOE_HYBRID_A2A_TOKENS": lambda: int(
+        os.getenv("VLLM_MOE_HYBRID_A2A_TOKENS", "0")
+    ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
     # the blockscale tensor of activations NVFP4 Quantization.
@@ -2472,6 +2483,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # Picks the all-to-all inside the opaque MoE custom op only.
+        "VLLM_MOE_HYBRID_A2A_TOKENS",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
