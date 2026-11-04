@@ -59,9 +59,19 @@ def offset_dense_mask_mod(
     kv_idx = utils.ssa_to_scalar(kv_idx) + key_start
     word_idx = kv_idx >> 5
     bit_idx = cutlass.Uint32(kv_idx & 31)
+    # FA4 asks for the 32 keys from a 32-aligned local kv_idx (bit j = key
+    # kv_idx + j). Unless key_start is a multiple of 32 they straddle two mask
+    # words, so funnel-shift the next word in; shl_u32 by 32 yields 0, which
+    # keeps aligned offsets exact. word_idx + 1 <= cdiv(max_seq_len, 32) stays
+    # inside the row because the global mask reserves a trailing word. That
+    # word may be the key_starts word or an uncleared pad word, but its bits
+    # map to keys at or past seqlen_k, which FA4 clears.
     word = dense_mask[batch_idx, q_idx, word_idx]
+    next_word = dense_mask[batch_idx, q_idx, word_idx + 1]
     result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
-    result[0] = utils.shr_u32(cutlass.Uint32(word), bit_idx)
+    result[0] = utils.shr_u32(cutlass.Uint32(word), bit_idx) | utils.shl_u32(
+        cutlass.Uint32(next_word), cutlass.Uint32(32 - (kv_idx & 31))
+    )
     return result.load()
 
 

@@ -1655,6 +1655,11 @@ PREFILL_BATCH_SPECS = {
     "short_context_dense_mha": BatchSpec(seq_lens=[128, 160], query_lens=[64, 32]),
     "masked_mha": BatchSpec(seq_lens=[256], query_lens=[256]),
     "masked_mha_chunked_context": BatchSpec(seq_lens=[448, 384], query_lens=[256, 256]),
+    # Contexts 199 and 133 are not multiples of 32: each 32-key group of the
+    # suffix straddles two words of the shared global mask.
+    "masked_mha_chunked_context_unaligned": BatchSpec(
+        seq_lens=[455, 389], query_lens=[256, 256]
+    ),
 }
 
 
@@ -1754,12 +1759,18 @@ def test_sparse_backend_prefill_correctness(
     kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
     scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
 
+    # Masked-MHA batches use zero-mean data: with all-positive inputs every
+    # score is dominated by the same per-key sum, attention is nearly one-hot,
+    # and a wrongly dropped top-k key only shows if it is a row's maximum.
+    data_offset = 0.5 if masked_mha else 0.0
+
+    def rand(*shape: int) -> torch.Tensor:
+        return torch.rand(*shape, dtype=dtype, device=device) - data_offset
+
     torch.manual_seed(42)
 
-    W_UK = torch.rand(
-        kv_lora_rank, num_heads, qk_nope_head_dim, dtype=dtype, device=device
-    )
-    W_UV = torch.rand(kv_lora_rank, num_heads, v_head_dim, dtype=dtype, device=device)
+    W_UK = rand(kv_lora_rank, num_heads, qk_nope_head_dim)
+    W_UV = rand(kv_lora_rank, num_heads, v_head_dim)
 
     seq_lens = batch_spec.seq_lens
     query_lens = batch_spec.query_lens
@@ -1780,15 +1791,9 @@ def test_sparse_backend_prefill_correctness(
         q_len = query_lens[i]
         ctx_len = s_len - q_len
 
-        q_mha = torch.rand(
-            q_len,
-            num_heads,
-            qk_nope_head_dim + qk_rope_head_dim,
-            dtype=dtype,
-            device=device,
-        )
-        kv_c_full = torch.rand(s_len, kv_lora_rank, dtype=dtype, device=device)
-        k_pe_full = torch.rand(s_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
+        q_mha = rand(q_len, num_heads, qk_nope_head_dim + qk_rope_head_dim)
+        kv_c_full = rand(s_len, kv_lora_rank)
+        k_pe_full = rand(s_len, 1, qk_rope_head_dim)
 
         # Decompress all KV for reference
         kv_b_weight = torch.cat([W_UK, W_UV], dim=-1).view(
@@ -1878,7 +1883,7 @@ def test_sparse_backend_prefill_correctness(
 
     builder_cls = backend_cls.get_builder_cls()
     builder = builder_cls(kv_cache_spec, ["placeholder"], vllm_config, device)
-    if batch_name == "masked_mha_chunked_context":
+    if batch_name.startswith("masked_mha_chunked_context"):
         builder.chunked_prefill_workspace_size = block_size * batch_spec.batch_size
         builder.chunked_prefill_workspace = torch.empty(
             (builder.chunked_prefill_workspace_size, head_size),
