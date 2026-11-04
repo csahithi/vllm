@@ -130,6 +130,7 @@ class UvaBackedTensor:
         size: int | Sequence[int],
         dtype: torch.dtype,
         max_concurrency: int | None = None,
+        device_mirror: bool = False,
     ):
         self.dtype = dtype
 
@@ -139,11 +140,30 @@ class UvaBackedTensor:
 
         # Buffers for concurrency
         self.pool = UvaBufferPool(size, dtype, max_concurrency)
-        self.gpu = self.pool.copy_to_uva(self.np)
+        # Optional device-memory copy for small tensors that kernels read often.
+        # GPU reads of pinned host memory through UVA can be slow when the pages
+        # sit on a NUMA node far from the GPU (e.g. GPUs 2-3 of a 2-socket VR200
+        # tray), and every TP rank then waits for the slowest one.
+        # Unlike the UVA view, the mirror is updated in stream order: a reader on
+        # another stream must wait for the stream that called copy_to_uva().
+        self._device: torch.Tensor | None = None
+        if device_mirror and self.pool._buffer_cls is UvaBuffer:
+            # Same device as the UVA view it replaces.
+            self._device = torch.zeros_like(self.pool._uva_bufs[0].uva())
+        self.gpu = self.copy_to_uva()
 
     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
         # CPU-to-CPU copy
-        self.gpu = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
+        uva = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
+        if self._device is None:
+            self.gpu = uva
+            return self.gpu
+        # Pinned-to-device copy on the current stream. The pinned slot is not
+        # reused for max_concurrency steps, as for the UVA readers.
+        m = uva.shape[0]
+        src = self.pool._uva_bufs[self.pool._curr].cpu[:m]
+        self._device[:m].copy_(src, non_blocking=True)
+        self.gpu = self._device[:m] if n is not None else self._device
         return self.gpu
 
 

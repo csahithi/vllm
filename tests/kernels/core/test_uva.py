@@ -172,6 +172,31 @@ def test_uva_pool_copy_to_gpu_preserves_shape_and_out(use_out, input_type):
 
 
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+def test_uva_backed_tensor_device_mirror(dtype):
+    """The mirror is one device buffer, separate from the pinned slots, that
+    every copy_to_uva() refreshes in stream order."""
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    with torch.accelerator.device_index(device.index):
+        t = buffer_utils.UvaBackedTensor(
+            8, dtype, max_concurrency=2, device_mirror=True
+        )
+        mirror = t.gpu
+        assert mirror.device == device
+        pinned = {buf.cpu.data_ptr() for buf in t.pool._uva_bufs}
+        assert mirror.data_ptr() not in pinned
+        for step in range(5):
+            t.np[:] = np.arange(8) + step
+            assert t.copy_to_uva() is mirror
+            torch.testing.assert_close(
+                mirror.cpu(), torch.from_numpy(t.np.copy()), rtol=0, atol=0
+            )
+        prefix = t.copy_to_uva(3)
+        assert prefix.shape == (3,)
+        assert prefix.data_ptr() == mirror.data_ptr()
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
 @pytest.mark.parametrize("uva_target", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
 def test_staged_write_inflight(uva_target, dtype):

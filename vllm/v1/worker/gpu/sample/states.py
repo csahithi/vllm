@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from functools import partial
+
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
@@ -19,11 +22,19 @@ class SamplingStates:
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
 
-        self.temperature = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.top_k = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
-        self.top_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.min_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.seeds = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
+        # The sampler, rejection sampler and drafter read these on the GPU: keep
+        # them in device memory (see UvaBackedTensor.device_mirror) instead of
+        # reading pinned host memory through UVA. The model runner refreshes them
+        # only on steps that admit requests.
+        # VLLM_SAMPLING_PARAMS_ON_DEVICE=0 restores the UVA reads.
+        new_tensor = partial(
+            UvaBackedTensor, device_mirror=envs.VLLM_SAMPLING_PARAMS_ON_DEVICE
+        )
+        self.temperature = new_tensor(max_num_reqs, dtype=torch.float32)
+        self.top_k = new_tensor(max_num_reqs, dtype=torch.int32)
+        self.top_p = new_tensor(max_num_reqs, dtype=torch.float32)
+        self.min_p = new_tensor(max_num_reqs, dtype=torch.float32)
+        self.seeds = new_tensor(max_num_reqs, dtype=torch.int64)
         # Tracks whether `seed` was set explicitly by the user, so callers
         # can fall back from RNG paths that don't honor per-request seeds.
         self.seeds_set = np.zeros(max_num_reqs, dtype=bool)

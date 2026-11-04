@@ -267,6 +267,7 @@ if TYPE_CHECKING:
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+    VLLM_SAMPLING_PARAMS_ON_DEVICE: bool = True
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -1975,6 +1976,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
     ),
+    # Model Runner V2: keep per-request temperature, top-k, top-p, min-p and
+    # seeds in device memory instead of reading them from pinned host memory
+    # through UVA. Set to 0 to restore the UVA reads.
+    "VLLM_SAMPLING_PARAMS_ON_DEVICE": lambda: bool(
+        int(os.getenv("VLLM_SAMPLING_PARAMS_ON_DEVICE", "1"))
+    ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
@@ -2554,6 +2561,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
         "VLLM_REQUEST_BODY_LOG_LEVEL",
+        # Where the sampler reads its parameters from; no compiled graph reads it.
+        "VLLM_SAMPLING_PARAMS_ON_DEVICE",
     }
 
     from vllm.config.utils import normalize_value

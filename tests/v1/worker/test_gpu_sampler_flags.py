@@ -137,6 +137,31 @@ def test_has_topp_only_rows():
     assert has_topp_only_rows([0], vocab_size=10)
 
 
+@pytest.mark.parametrize("on_device", [False, True])
+def test_sampling_params_reach_the_device(monkeypatch, on_device: bool):
+    """Sampling parameters read on the device match the host copy after every
+    admission, with or without the device mirror."""
+    monkeypatch.setenv("VLLM_SAMPLING_PARAMS_ON_DEVICE", str(int(on_device)))
+    states = _make_sampler().sampling_states
+    params = [
+        SamplingParams(temperature=0.5, top_k=7, top_p=0.9, min_p=0.1, seed=3),
+        SamplingParams(temperature=0.0, seed=5),
+        SamplingParams(top_k=VOCAB_SIZE + 1, top_p=0.5),
+    ]
+    for req_idx, sampling_params in enumerate(params):
+        states.add_request(req_idx, sampling_params)
+        states.apply_staged_writes()
+        for t in (
+            states.temperature,
+            states.top_k,
+            states.top_p,
+            states.min_p,
+            states.seeds,
+        ):
+            assert t.gpu.is_cuda
+            assert torch.equal(t.gpu.cpu(), torch.from_numpy(t.np.copy()))
+
+
 def test_logits_processing_cache_only_checks_active_requests():
     sampler = _make_sampler()
     sampler.add_request(0, SamplingParams(temperature=0.0))
