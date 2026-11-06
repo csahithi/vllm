@@ -329,6 +329,7 @@ steps:
   - "!vllm/distributed/kv_transfer/"
   - tests/v1/distributed
   - tests/v1/engine/test_engine_core_client.py
+  - tests/distributed/conftest.py
   - tests/distributed/test_utils
   - tests/distributed/test_engram_dp_shard.py
   - vllm/config/engram.py
@@ -361,6 +362,7 @@ steps:
       - vllm/distributed/
       - tests/v1/distributed
       - tests/v1/engine/test_engine_core_client.py
+      - tests/distributed/conftest.py
       - tests/distributed/test_utils
       - tests/distributed/test_engram_dp_shard.py
       - vllm/config/engram.py
@@ -392,6 +394,7 @@ steps:
   - "!vllm/distributed/kv_transfer/"
   - tests/distributed/test_pynccl
   - tests/distributed/test_events
+  - tests/distributed/conftest.py
   - tests/distributed/test_symm_mem_allreduce.py
   - tests/distributed/test_multiproc_executor.py
   - tests/distributed/test_pp_transport.py
@@ -420,6 +423,7 @@ steps:
       - vllm/distributed/
       - tests/distributed/test_pynccl
       - tests/distributed/test_events
+      - tests/distributed/conftest.py
       - tests/distributed/test_symm_mem_allreduce.py
       - tests/distributed/test_multiproc_executor.py
       - vllm/platforms/rocm.py

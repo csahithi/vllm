@@ -11,6 +11,7 @@ import json
 import os
 import random
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -181,6 +182,54 @@ def _run_in_new_process_group(
     child_process_fxn(env_dict, model, vllm_serve_args)
 
 
+def get_open_port_below_ephemeral_range() -> int:
+    """Return a free TCP port that the kernel never hands out on its own.
+
+    get_open_port() returns an ephemeral port and closes its probe socket, so
+    until the server binds it, any bind(0) or outgoing connect() on the host
+    can be handed the same number: gloo/NCCL/ZMQ listeners, or other CI pods
+    sharing the host network. This picks from 21000-29299 instead, below
+    ip_local_port_range, so only an explicit bind into it can race the server.
+    The range also avoids Ray's worker ports (10002-19999), the NIXL PD tests'
+    prefill ports (20000 in steps of 100), torch's MASTER_PORT default and the
+    ports tests derive from it (29500+), and Kubernetes NodePorts (30000+),
+    which kube-proxy redirects without binding. An ephemeral range starting
+    inside it narrows the pick. Falls back to get_open_port() when explicit
+    port settings apply, the ephemeral range cannot be read or starts at or
+    below 21000, or no free port turns up.
+    """
+    if envs.VLLM_PORT is not None or "VLLM_DP_MASTER_PORT" in os.environ:
+        return get_open_port()
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            ephemeral_start = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return get_open_port()
+    # Callers such as the random_port fixture also bind a few ports above it.
+    lower, upper = 21000, min(ephemeral_start, 29300)
+    if upper <= lower:
+        return get_open_port()
+    reserved: list[range] = []
+    with (
+        contextlib.suppress(OSError, ValueError),
+        open("/proc/sys/net/ipv4/ip_local_reserved_ports") as f,
+    ):
+        for item in filter(None, f.read().strip().split(",")):
+            lo, _, hi = item.partition("-")
+            reserved.append(range(int(lo), int(hi or lo) + 1))
+    # SystemRandom, not the module RNG: tests seed `random`, so jobs sharing a
+    # host would otherwise try the same ports in the same order.
+    rng = random.SystemRandom()
+    for _ in range(100):
+        port = rng.randrange(lower, upper)
+        if any(port in r for r in reserved):
+            continue
+        with socket.socket() as sock, contextlib.suppress(OSError):
+            sock.bind(("", port))
+            return port
+    return get_open_port()
+
+
 class RemoteVLLMServer:
     """Base class for launching vLLM server subprocesses for testing.
 
@@ -239,8 +288,11 @@ class RemoteVLLMServer:
 
             # No need for a port if using unix sockets
             if "--uds" not in vllm_serve_args:
+                # The server binds this port seconds later, so keep it out of
+                # the ephemeral range other sockets draw from meanwhile.
+                port = get_open_port_below_ephemeral_range()
                 # Don't mutate the input args
-                vllm_serve_args = vllm_serve_args + ["--port", str(get_open_port())]
+                vllm_serve_args = vllm_serve_args + ["--port", str(port)]
         if seed is not None:
             if "--seed" in vllm_serve_args:
                 raise ValueError(

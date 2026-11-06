@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-import random
 
 import msgspec
 import msgspec.msgpack
@@ -11,6 +10,7 @@ import zmq
 from vllm.config.kv_events import KVEventsConfig
 from vllm.distributed.kv_events import EventPublisherFactory
 
+from ..utils import get_open_port_below_ephemeral_range
 from .test_events import SampleBatch
 
 DP_RANK = 0
@@ -18,8 +18,9 @@ DP_RANK = 0
 
 @pytest.fixture
 def random_port():
-    """Generate a random port number for testing."""
-    return random.randint(10000, 59900)
+    """A free port below the ephemeral range, so no auto-assigned socket can
+    take it before the publisher binds it (tests also bind +1, +100, +101)."""
+    return get_open_port_below_ephemeral_range()
 
 
 @pytest.fixture
