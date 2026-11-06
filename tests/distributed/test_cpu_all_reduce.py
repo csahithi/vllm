@@ -12,10 +12,11 @@ import torch.multiprocessing as mp
 
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.distributed.utils import (
+    allocate_group_ports,
     cpu_all_reduce_,
+    fetch_group_ports,
     stateless_init_torch_distributed_process_group,
 )
-from vllm.utils.network_utils import get_open_port
 
 pytestmark = pytest.mark.cpu_test
 
@@ -27,10 +28,35 @@ def _make_input(rank: int, world_size: int, step: int) -> torch.Tensor:
     return t
 
 
-def _worker(rank: int, world_size: int, port: int, stateless_port: int):
+def _stateless_gloo_group(store: dist.Store, rank: int, world_size: int):
+    # Rank 0 binds the port itself and keeps the socket open until the
+    # TCPStore takes it over. A port probed with get_open_port() is released
+    # before the ranks bind it, and the gloo groups' ephemeral listeners can
+    # be given that port in between (EADDRINUSE).
+    if rank == 0:
+        (port,), (listen_socket,) = allocate_group_ports(
+            store, "stateless_pg", "127.0.0.1", 1
+        )
+    else:
+        (port,) = fetch_group_ports(store, "stateless_pg", 1)
+        listen_socket = None
+    return stateless_init_torch_distributed_process_group(
+        "127.0.0.1",
+        port,
+        rank,
+        world_size,
+        backend="gloo",
+        listen_socket=listen_socket,
+    )
+
+
+def _worker(rank: int, world_size: int, store_path: str):
+    # File rendezvous instead of a probed TCP port, for the same reason as
+    # in _stateless_gloo_group. The store also carries the stateless port.
+    store = dist.FileStore(store_path, world_size)
     dist.init_process_group(
         "gloo",
-        init_method=f"tcp://127.0.0.1:{port}",
+        store=store,
         rank=rank,
         world_size=world_size,
     )
@@ -64,9 +90,7 @@ def _worker(rank: int, world_size: int, port: int, stateless_port: int):
 
     # Unregistered (stateless) process group, as used by the engine-core DP
     # group and elastic EP.
-    stateless_pg = stateless_init_torch_distributed_process_group(
-        "127.0.0.1", stateless_port, rank, world_size, backend="gloo"
-    )
+    stateless_pg = _stateless_gloo_group(store, rank, world_size)
     expected = _make_input(rank, world_size, 0)
     dist.all_reduce(expected)
     t = _make_input(rank, world_size, 0)
@@ -78,19 +102,18 @@ def _worker(rank: int, world_size: int, port: int, stateless_port: int):
 
 # Non-power-of-two sizes exercise the cross-block exchange.
 @pytest.mark.parametrize("world_size", [2, 3, 4, 6, 8, 9, 12])
-def test_cpu_all_reduce(world_size: int):
+def test_cpu_all_reduce(world_size: int, tmp_path):
     mp.spawn(
         _worker,
-        args=(world_size, get_open_port(), get_open_port()),
+        args=(world_size, str(tmp_path / "store")),
         nprocs=world_size,
         join=True,
     )
 
 
-def _timeout_worker(rank: int, world_size: int, port: int):
-    pg = stateless_init_torch_distributed_process_group(
-        "127.0.0.1", port, rank, world_size, backend="gloo"
-    )
+def _timeout_worker(rank: int, world_size: int, store_path: str):
+    store = dist.FileStore(store_path, world_size)
+    pg = _stateless_gloo_group(store, rank, world_size)
     if rank != 0:
         # Never joins the all-reduce; rank 0's p2p wait must time out
         # well before this peer goes away.
@@ -103,5 +126,5 @@ def _timeout_worker(rank: int, world_size: int, port: int):
     assert time.monotonic() - start < 3
 
 
-def test_cpu_all_reduce_timeout():
-    mp.spawn(_timeout_worker, args=(2, get_open_port()), nprocs=2, join=True)
+def test_cpu_all_reduce_timeout(tmp_path):
+    mp.spawn(_timeout_worker, args=(2, str(tmp_path / "store")), nprocs=2, join=True)
