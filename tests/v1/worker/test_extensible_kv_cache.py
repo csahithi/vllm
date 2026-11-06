@@ -727,3 +727,88 @@ def test_committed_kv_cache_tensors_match_views(vmm, layout):
                 assert view.stride(0) * view.element_size() == tensor.block_stride
     finally:
         kv_cache.free()
+
+
+def _capturing_worker(
+    kv_cache: ExtensibleKVCache,
+    dcp_size: int = 1,
+    adaptive_verification: object | None = None,
+    needs_capture: bool = True,
+) -> SimpleNamespace:
+    """The parts of a Worker that `_release_warmup_kv_blocks` reads."""
+    runner = SimpleNamespace(
+        extensible_kv_cache=kv_cache,
+        dcp_size=dcp_size,
+        adaptive_verification=adaptive_verification,
+        needs_cudagraph_capture=lambda: needs_capture,
+    )
+    return SimpleNamespace(_v2_model_runner=lambda: runner)
+
+
+@requires_cuda
+@pytest.mark.parametrize("layout", [KVCacheLayout.LBNHC, KVCacheLayout.BLNHC])
+def test_warmup_blocks_are_released_before_capture(vmm, layout):
+    """The cache is sized around the CUDA graph pool only after capture, so
+    capture starts from the blocks allocation commits: the rest warmup
+    committed are dropped under the same reservation, and the final commit
+    grows from there."""
+    from vllm.v1.worker.gpu_worker import Worker
+
+    config, _ = _make_config(layout)
+    device = torch.device("cuda")
+    kv_cache = ExtensibleKVCache(config, device, layout)
+    try:
+        views = allocate_kv_cache(config, device, layout, allocate=kv_cache.allocate)
+        kv_cache.commit(6)
+        for view in views.values():
+            view[:6].fill_(1.0)
+        torch.accelerator.synchronize()
+        base_ptr = kv_cache.buffer.base_ptr
+
+        Worker._release_warmup_kv_blocks(_capturing_worker(kv_cache))
+        min_blocks = kv_cache.min_committed_blocks
+        assert min_blocks == (2 if layout.is_block_outermost else 1)
+        assert kv_cache.num_committed_blocks == min_blocks
+        assert kv_cache.physical_bytes <= kv_cache.physical_bytes_for(min_blocks)
+        # Captured graphs keep addressing the same reservation.
+        assert kv_cache.buffer.base_ptr == base_ptr
+
+        # The commit after capture backs every block, none with warmup data.
+        kv_cache.commit(NUM_BLOCKS, shrink=True)
+        assert kv_cache.num_committed_blocks == NUM_BLOCKS
+        for view in views.values():
+            assert torch.count_nonzero(view) == 0
+    finally:
+        kv_cache.free()
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "runner_state",
+    [
+        # FULL graphs are captured over DCP context in the committed blocks.
+        {"dcp_size": 2},
+        # Capture profiles step costs over context in the committed blocks.
+        {"adaptive_verification": object()},
+        # Nothing is captured; the final commit shrinks the cache if needed.
+        {"needs_capture": False},
+    ],
+    ids=["dcp", "adaptive_verification", "no_capture"],
+)
+def test_warmup_blocks_stay_when_capture_reads_them(vmm, runner_state):
+    """Warmup's blocks stay committed when capture's own runs read them, or
+    when there is no capture to make room for."""
+    from vllm.v1.worker.gpu_worker import Worker
+
+    layout = KVCacheLayout.LBNHC
+    config, _ = _make_config(layout)
+    device = torch.device("cuda")
+    kv_cache = ExtensibleKVCache(config, device, layout)
+    try:
+        allocate_kv_cache(config, device, layout, allocate=kv_cache.allocate)
+        kv_cache.commit(6)
+
+        Worker._release_warmup_kv_blocks(_capturing_worker(kv_cache, **runner_state))
+        assert kv_cache.num_committed_blocks == 6
+    finally:
+        kv_cache.free()
