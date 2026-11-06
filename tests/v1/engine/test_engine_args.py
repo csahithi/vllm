@@ -415,6 +415,40 @@ def test_extensible_kv_cache_off_with_elastic_ep(monkeypatch, requested):
         assert config.cache_config.enable_extensible_kv_cache is False
 
 
+@pytest.mark.parametrize("pcp_size", [1, 2])
+@pytest.mark.parametrize("requested", [None, True])
+def test_extensible_kv_cache_off_with_prefill_context_parallel(
+    monkeypatch, pcp_size, requested
+):
+    """PCP warmup and profile runs can read KV blocks an extensible cache has
+    not committed yet, so with PCP it is off by default but an explicit request
+    is honored; without PCP it is unaffected."""
+    from types import SimpleNamespace
+
+    import vllm.platforms
+    from vllm.config.vllm import VllmConfig
+
+    monkeypatch.setattr(
+        vllm.platforms, "current_platform", SimpleNamespace(is_cuda_alike=lambda: True)
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            _extensible_kv_cache_resolved=False,
+            enable_extensible_kv_cache=requested,
+            kv_cache_memory_bytes=None,
+            num_gpu_blocks_override=None,
+        ),
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            enable_elastic_ep=False, prefill_context_parallel_size=pcp_size
+        ),
+        kv_transfer_config=None,
+    )
+    VllmConfig._resolve_extensible_kv_cache(config)
+    expected = bool(requested) or pcp_size == 1
+    assert config.cache_config.enable_extensible_kv_cache is expected
+
+
 @pytest.mark.parametrize(
     ("connector", "buffer_device", "registers"),
     [
@@ -484,7 +518,9 @@ def test_extensible_kv_cache_off_for_rocm_registering_connector(
         ),
         use_v2_model_runner=True,
         attention_config=SimpleNamespace(hisparse_config=None),
-        parallel_config=SimpleNamespace(enable_elastic_ep=False),
+        parallel_config=SimpleNamespace(
+            enable_elastic_ep=False, prefill_context_parallel_size=1
+        ),
         kv_transfer_config=KVTransferConfig(
             kv_connector="NixlConnector", kv_role="kv_both", kv_buffer_device="cuda"
         ),
@@ -532,7 +568,9 @@ def test_extensible_kv_cache_off_with_lmcache_mp(monkeypatch, multi, requested):
         ),
         use_v2_model_runner=True,
         attention_config=SimpleNamespace(hisparse_config=None),
-        parallel_config=SimpleNamespace(enable_elastic_ep=False),
+        parallel_config=SimpleNamespace(
+            enable_elastic_ep=False, prefill_context_parallel_size=1
+        ),
         kv_transfer_config=transfer,
     )
     if requested:

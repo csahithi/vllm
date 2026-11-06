@@ -5,7 +5,10 @@ num_fewshot: 5
 max_concurrency: 100
 # Preserve KV-cache headroom after CUDA graph memory profiling and bound the
 # DCP-aware FlashInfer workspace to 2.39 GiB at the 4,096-token scheduler cap.
+# PCP turns the extensible KV cache off by default; this DCP config runs on
+# FLASHMLA_SPARSE, which works with it, so keep it opted in.
 server_args: >-
+  --enable-extensible-kv-cache
   --compilation-config '{"cudagraph_mode":"PIECEWISE"}'
   --gpu-memory-utilization 0.96
   --max-model-len 4096

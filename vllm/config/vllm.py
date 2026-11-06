@@ -3497,6 +3497,25 @@ class VllmConfig:
             )
         if requested is None:
             cache_config.enable_extensible_kv_cache = unsupported is None
+            if (
+                unsupported is None
+                and self.parallel_config.prefill_context_parallel_size > 1
+            ):
+                # TODO: drop once PCP warmup and profile runs only read
+                # committed KV blocks. Until capture only the null block is
+                # committed, and the PCP prefill dummy runs (seen with
+                # FLASHINFER_MLA_SPARSE) read KV rows past it: an illegal memory
+                # access that a fully allocated, profile-sized cache never
+                # exposed. Only the default changes; an explicit opt-in stays
+                # allowed for backends known to work.
+                cache_config.enable_extensible_kv_cache = False
+                logger.info_once(
+                    "Extensible KV cache disabled by default with prefill "
+                    "context parallel: its warmup and profile runs can read KV "
+                    "cache blocks that are not committed yet. The KV cache will "
+                    "be sized from profiling instead; pass "
+                    "--enable-extensible-kv-cache to override."
+                )
         elif requested and unsupported is not None:
             raise ValueError(f"enable_extensible_kv_cache: {unsupported}.")
 
