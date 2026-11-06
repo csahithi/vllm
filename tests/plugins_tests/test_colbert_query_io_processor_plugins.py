@@ -51,7 +51,11 @@ def _check_token_embeddings(entry, expected_input_type: str):
     return embedding
 
 
-@pytest.fixture(scope="module")
+# Class-scoped (not module-scoped) so the server is shut down, and its GPU
+# memory released, before the offline tests below start their own engine on
+# the same GPU. Both engines use the default gpu_memory_utilization, so they
+# cannot run side by side on a small GPU such as an L4.
+@pytest.fixture(scope="class")
 def server():
     args = [
         "--runner",
@@ -84,61 +88,63 @@ def _post_pooling(server: RemoteOpenAIServer, data: dict):
     return parsed_response
 
 
-def test_colbert_query_plugin_query_online(server: RemoteOpenAIServer):
-    """Queries are expanded to exactly query_maxlen token vectors."""
-    parsed_response = _post_pooling(
-        server, {"input": model_config["query_input"], "input_type": "query"}
-    )
+class TestColbertQueryPluginOnline:
+    def test_colbert_query_plugin_query_online(self, server: RemoteOpenAIServer):
+        """Queries are expanded to exactly query_maxlen token vectors."""
+        parsed_response = _post_pooling(
+            server, {"input": model_config["query_input"], "input_type": "query"}
+        )
 
-    data = _get_attr_or_val(parsed_response, "data")
-    assert len(data) == 1
+        data = _get_attr_or_val(parsed_response, "data")
+        assert len(data) == 1
 
-    embedding = _check_token_embeddings(data[0], "query")
-    assert len(embedding) == model_config["query_maxlen"]
-
-    usage = _get_attr_or_val(parsed_response, "usage")
-    assert _get_attr_or_val(usage, "prompt_tokens") == model_config["query_maxlen"]
-
-
-def test_colbert_query_plugin_document_online(server: RemoteOpenAIServer):
-    """Documents return one vector per token, with no mask expansion."""
-    parsed_response = _post_pooling(
-        server, {"input": model_config["document_input"], "input_type": "document"}
-    )
-
-    data = _get_attr_or_val(parsed_response, "data")
-    assert len(data) == 1
-
-    embedding = _check_token_embeddings(data[0], "document")
-    # No query expansion: number of vectors tracks the input length.
-    assert len(embedding) != model_config["query_maxlen"]
-
-    usage = _get_attr_or_val(parsed_response, "usage")
-    assert _get_attr_or_val(usage, "prompt_tokens") == len(embedding)
-
-
-def test_colbert_query_plugin_missing_input_type_online(server: RemoteOpenAIServer):
-    """input_type is required; omitting it is rejected."""
-    request_payload = {
-        "model": model_config["model_name"],
-        "task": "plugin",
-        "data": {"input": model_config["document_input"]},
-    }
-    ret = requests.post(server.url_for("pooling"), json=request_payload)
-    assert ret.status_code == 400
-
-
-def test_colbert_query_plugin_batch_online(server: RemoteOpenAIServer):
-    """A list input returns one entry per prompt."""
-    queries = ["What is machine learning?", "What is deep learning?"]
-    parsed_response = _post_pooling(server, {"input": queries, "input_type": "query"})
-
-    data = _get_attr_or_val(parsed_response, "data")
-    assert len(data) == len(queries)
-    for i, entry in enumerate(data):
-        assert _get_attr_or_val(entry, "index") == i
-        embedding = _check_token_embeddings(entry, "query")
+        embedding = _check_token_embeddings(data[0], "query")
         assert len(embedding) == model_config["query_maxlen"]
+
+        usage = _get_attr_or_val(parsed_response, "usage")
+        assert _get_attr_or_val(usage, "prompt_tokens") == model_config["query_maxlen"]
+
+    def test_colbert_query_plugin_document_online(self, server: RemoteOpenAIServer):
+        """Documents return one vector per token, with no mask expansion."""
+        parsed_response = _post_pooling(
+            server, {"input": model_config["document_input"], "input_type": "document"}
+        )
+
+        data = _get_attr_or_val(parsed_response, "data")
+        assert len(data) == 1
+
+        embedding = _check_token_embeddings(data[0], "document")
+        # No query expansion: number of vectors tracks the input length.
+        assert len(embedding) != model_config["query_maxlen"]
+
+        usage = _get_attr_or_val(parsed_response, "usage")
+        assert _get_attr_or_val(usage, "prompt_tokens") == len(embedding)
+
+    def test_colbert_query_plugin_missing_input_type_online(
+        self, server: RemoteOpenAIServer
+    ):
+        """input_type is required; omitting it is rejected."""
+        request_payload = {
+            "model": model_config["model_name"],
+            "task": "plugin",
+            "data": {"input": model_config["document_input"]},
+        }
+        ret = requests.post(server.url_for("pooling"), json=request_payload)
+        assert ret.status_code == 400
+
+    def test_colbert_query_plugin_batch_online(self, server: RemoteOpenAIServer):
+        """A list input returns one entry per prompt."""
+        queries = ["What is machine learning?", "What is deep learning?"]
+        parsed_response = _post_pooling(
+            server, {"input": queries, "input_type": "query"}
+        )
+
+        data = _get_attr_or_val(parsed_response, "data")
+        assert len(data) == len(queries)
+        for i, entry in enumerate(data):
+            assert _get_attr_or_val(entry, "index") == i
+            embedding = _check_token_embeddings(entry, "query")
+            assert len(embedding) == model_config["query_maxlen"]
 
 
 @pytest.mark.parametrize("input_type", ["query", "document"])
