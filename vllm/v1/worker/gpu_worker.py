@@ -1022,6 +1022,47 @@ class Worker(WorkerBase):
         extend_kv_cache(self.model_runner, self._kv_cache_config, num_blocks)
         self.cache_config.num_gpu_blocks = num_blocks
 
+    def _release_warmup_kv_blocks(self) -> None:
+        """Shrink an extensible KV cache back to `min_committed_blocks` for
+        capture.
+
+        Warmup commits blocks up to `warmup_committable_blocks`, which keeps
+        its own transients free but not the CUDA graph pool: this cache does
+        not profile capture (`profile_cudagraph_memory` returns 0) and counts
+        the pool when `measure_kv_cache_blocks` sizes it after capture. With
+        large blocks (e.g. hybrid Mamba models) warmup can commit nearly all
+        free memory, and capture then runs out of it. The blocks hold warmup
+        garbage and the address range stays reserved, so views and captured
+        graphs stay valid; `extend_kv_cache` commits the measured size.
+        """
+        model_runner = self.model_runner
+        kv_cache = model_runner.extensible_kv_cache
+        assert kv_cache is not None
+        min_blocks = kv_cache.min_committed_blocks
+        if (
+            kv_cache.num_committed_blocks <= min_blocks
+            or not model_runner.needs_cudagraph_capture()
+        ):
+            return
+        if model_runner.dcp_size > 1:
+            # FULL graphs are captured over DCP context whose block ids run
+            # past the null block (`set_dcp_capture_context` wraps them by the
+            # capacity, not the committed prefix).
+            return
+        if model_runner.adaptive_verification is not None:
+            # Capture profiles its step costs over context spread across the
+            # committed blocks; a lone null block would make those reads cheap.
+            return
+        num_released = kv_cache.num_committed_blocks - min_blocks
+        physical_bytes_before = kv_cache.physical_bytes
+        kv_cache.commit(min_blocks, shrink=True)
+        logger.info(
+            "Released %d KV cache blocks (%s GiB) committed by warmup before "
+            "CUDA graph capture; the KV cache is sized after capture.",
+            num_released,
+            format_gib(physical_bytes_before - kv_cache.physical_bytes),
+        )
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # Warmup forwards record expert load like real ones.
@@ -1102,6 +1143,9 @@ class Worker(WorkerBase):
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
+            if self.cache_config.enable_extensible_kv_cache:
+                # Leave capture the memory warmup committed to KV blocks.
+                self._release_warmup_kv_blocks()
             with self._get_cudagraph_capture_context():
                 cuda_graph_memory_bytes = self.model_runner.capture_model()
 
