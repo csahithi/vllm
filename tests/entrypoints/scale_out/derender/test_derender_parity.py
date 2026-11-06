@@ -102,6 +102,26 @@ async def _coupled(client: httpx.AsyncClient, messages: list[dict], **extra) -> 
     return resp.json()
 
 
+async def _disagg_choices(
+    client: httpx.AsyncClient,
+    choices: list[dict],
+    prompt_tokens: int,
+    chat_request: dict,
+) -> dict:
+    """Derender one `GenerateResponse` carrying the given generate choices."""
+    resp = await client.post(
+        "/v1/chat/completions/derender",
+        json={
+            "model": MODEL,
+            "generate_response": {"request_id": "parity", "choices": choices},
+            "prompt_tokens": prompt_tokens,
+            "chat_request": {"return_token_ids": True, **chat_request},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
 async def _disagg(
     client: httpx.AsyncClient,
     output_ids: list[int],
@@ -110,27 +130,19 @@ async def _disagg(
     chat_request: dict,
     logprobs: dict | None = None,
 ) -> dict:
-    resp = await client.post(
-        "/v1/chat/completions/derender",
-        json={
-            "model": MODEL,
-            "generate_response": {
-                "request_id": "parity",
-                "choices": [
-                    {
-                        "index": 0,
-                        "token_ids": output_ids,
-                        "finish_reason": finish_reason,
-                        "logprobs": logprobs,
-                    }
-                ],
-            },
-            "prompt_tokens": prompt_tokens,
-            "chat_request": {"return_token_ids": True, **chat_request},
-        },
+    return await _disagg_choices(
+        client,
+        [
+            {
+                "index": 0,
+                "token_ids": output_ids,
+                "finish_reason": finish_reason,
+                "logprobs": logprobs,
+            }
+        ],
+        prompt_tokens,
+        chat_request,
     )
-    assert resp.status_code == 200, resp.text
-    return resp.json()
 
 
 def _tool_sig(response_choice: dict) -> list[tuple[str, dict]]:
@@ -944,7 +956,7 @@ def _assert_inline_parity(coupled: dict, inline: dict) -> None:
             assert c["message"].get("reasoning") is None
             continue
         assert i["token_ids"] == c["token_ids"], (
-            "greedy or seeded generation was expected to be deterministic "
+            "greedy generation was expected to be deterministic "
             "across the coupled and inline calls"
         )
         assert i["message"]["content"] == c["message"]["content"]
@@ -997,11 +1009,6 @@ def _assert_inline_parity(coupled: dict, inline: dict) -> None:
         pytest.param(
             "Write two short lines about the sea.", {"stop": ["\n"]}, id="stop"
         ),
-        pytest.param(
-            TEXT_MESSAGES[0]["content"],
-            {"n": 2, "temperature": 0.8, "seed": 42},
-            id="n2",
-        ),
     ],
 )
 async def test_inline_derender_parity(client, content, extra):
@@ -1015,6 +1022,49 @@ async def test_inline_derender_parity(client, content, extra):
 
     if extra.get("parallel_tool_calls") is False:
         assert len(_tool_sig(inline["choices"][0])) <= 1
+
+
+# Seeded n=2 sampling. The children of one request are admitted to the engine
+# separately, so whether they prefill together is a timing race, and vLLM is
+# not batch invariant: two such requests can sample different tokens. The n=2
+# cases therefore derender the inline call's own token IDs per choice instead
+# of comparing against a second, independent generation.
+N2_SAMPLING = {"n": 2, "temperature": 0.8, "seed": 42}
+
+
+@pytest.mark.asyncio
+async def test_inline_derender_n2(client):
+    """Each inline n=2 choice matches derendering that choice's own token IDs
+    in one batch `/derender` call, so choices are neither swapped nor share
+    parser state."""
+    messages = TEXT_MESSAGES
+    inline = await _inline_derender(client, messages, **N2_SAMPLING)
+    assert [c["index"] for c in inline["choices"]] == [0, 1]
+
+    disagg = await _disagg_choices(
+        client,
+        [
+            {
+                "index": c["index"],
+                "token_ids": c["token_ids"],
+                "finish_reason": _engine_finish_reason(c["finish_reason"]),
+            }
+            for c in inline["choices"]
+        ],
+        inline["usage"]["prompt_tokens"],
+        {"model": MODEL, "messages": messages, **N2_SAMPLING},
+    )
+    assert [d["index"] for d in disagg["choices"]] == [0, 1]
+    for i, d in zip(inline["choices"], disagg["choices"]):
+        assert d["token_ids"] == i["token_ids"]
+        assert d["message"]["content"] == i["message"]["content"]
+        assert d["message"].get("reasoning") == i["message"].get("reasoning")
+        assert _tool_sig(d) == _tool_sig(i)
+        assert _tool_id_shapes(d) == _tool_id_shapes(i)
+        assert d["finish_reason"] == i["finish_reason"]
+    completion_tokens = sum(len(c["token_ids"]) for c in inline["choices"])
+    assert inline["usage"]["completion_tokens"] == completion_tokens
+    assert disagg["usage"]["completion_tokens"] == completion_tokens
 
 
 def _top_tokens(entry: dict) -> list[str]:
@@ -1141,11 +1191,6 @@ async def _inline_derender_stream(
         pytest.param(
             "Write two short lines about the sea.", {"stop": ["\n"]}, id="stop"
         ),
-        pytest.param(
-            TEXT_MESSAGES[0]["content"],
-            {"n": 2, "temperature": 0.8, "seed": 42},
-            id="n2",
-        ),
     ],
 )
 async def test_inline_derender_stream_parity(client, content, extra):
@@ -1178,6 +1223,44 @@ async def test_inline_derender_stream_parity(client, content, extra):
         assert inline == coupled
         if extra.get("parallel_tool_calls") is False:
             assert len(inline["tool_calls"]) <= 1
+
+
+@pytest.mark.asyncio
+async def test_inline_derender_stream_n2(client):
+    """Each streamed inline n=2 choice matches replaying that choice's own
+    chunks through streaming derender, one index at a time as that protocol
+    expects, with the same chunk boundaries."""
+    messages = TEXT_MESSAGES
+    inline_choices = await _inline_derender_stream(client, messages, **N2_SAMPLING)
+    prompt_token_ids = await _render_token_ids(client, messages)
+    chat_request = {
+        "model": MODEL,
+        "messages": messages,
+        "return_token_ids": True,
+        **N2_SAMPLING,
+    }
+    assert {c["index"] for c in inline_choices} == {0, 1}
+
+    for index in (0, 1):
+        inline_index = [c for c in inline_choices if c["index"] == index]
+        roles = [c["delta"] for c in inline_index if c["delta"].get("role")]
+        assert len(roles) == 1
+        finish_reason = inline_index[-1]["finish_reason"]
+        assert finish_reason is not None
+        disagg = await stream_chat_derender(
+            client,
+            [t for c in inline_index for t in c["token_ids"]],
+            [len(c["token_ids"]) for c in inline_index],
+            chat_request,
+            len(prompt_token_ids),
+            prompt_token_ids,
+            finish_reason=_engine_finish_reason(finish_reason),
+        )
+        inline = assemble_stream(inline_index)
+        for message in (inline, disagg):
+            for tc in message["tool_calls"]:
+                tc["id"] = _tool_call_id_shape(tc["id"])
+        assert disagg == inline
 
 
 def _streamed_logprobs(choices: list[dict]) -> list[dict]:
