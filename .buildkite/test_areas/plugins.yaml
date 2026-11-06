@@ -11,6 +11,7 @@ steps:
   source_file_dependencies:
   - vllm/plugins/
   - tests/plugins/
+  - tests/plugins_tests/
   # Import-time platform resolution (see test_import_vllm_does_not_resolve_platform)
   - vllm/__init__.py
   - vllm/env_override.py
