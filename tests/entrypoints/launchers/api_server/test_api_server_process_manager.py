@@ -14,62 +14,45 @@ import pytest
 import zmq
 
 import vllm.envs as envs
+
+# The spawn targets live in a module without torch or vllm imports at module
+# level, so spawned children do not re-import this module and all of its
+# imports.
+from tests.entrypoints.launchers.api_server.process_manager_workers import (
+    adopt_zmq_listener_worker,
+    mock_run_api_server_worker,
+    update_admission_stats_worker,
+)
 from vllm.utils.network_utils import make_zmq_listener, make_zmq_socket
-from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.utils import (
     APIServerProcessManager,
     wait_for_completion_or_failure,
 )
 
-# Global variables to control worker behavior
-WORKER_RUNTIME_SECONDS = 0.5
+# Default runtime of mock_run_api_server_worker, passed via `args.runtime`.
+# The workers start in well under a second, so liveness checks must not race
+# their runtime; shutdown() terminates them long before it ends.
+WORKER_RUNTIME_SECONDS = 60.0
+
+# How long test_normal_completion waits for its mock workers to exit. It stays
+# below that test's pytest timeout so a hang names the stuck process.
+MOCK_WORKER_EXIT_TIMEOUT_S = 20.0
+
+# Bound on each wait for workers that must import torch and vllm (admission
+# stats, ZMQ listener adoption): seconds per child when idle, 30s+ on a loaded
+# CI host. A deadlock still fails within it.
+IMPORTING_WORKER_TIMEOUT_S = 120.0
 
 
-# Mock implementation of run_api_server_worker
-def mock_run_api_server_worker(listen_address, sock, args, client_config=None):
-    """Mock run_api_server_worker that runs for a specific time."""
-    print(f"Mock worker started with client_config: {client_config}")
-    time.sleep(WORKER_RUNTIME_SECONDS)
-    print("Mock worker completed successfully")
-
-
-def update_admission_stats_worker(listen_address, sock, args, client_config):
-    stats = SharedAdmissionStats(
-        client_config,
-        client_config["client_count"],
-        client_config["client_index"],
+def _join_all(processes, timeout_s: float) -> None:
+    """Wait up to `timeout_s` in total for every process to exit cleanly."""
+    deadline = time.monotonic() + timeout_s
+    for proc in processes:
+        proc.join(timeout=max(0.0, deadline - time.monotonic()))
+    exitcodes = {proc.name: proc.exitcode for proc in processes}
+    assert all(code == 0 for code in exitcodes.values()), (
+        f"Not every process exited cleanly within {timeout_s}s: {exitcodes}"
     )
-    value = client_config["client_index"] + 1
-    stats.set_num_requests(value)
-    args.barrier.wait()
-    args.results.put(stats.get_num_requests())
-
-
-def _adopt_zmq_listener_worker(listen_address, sock, args, client_config):
-    ctx = zmq.Context()
-    router = make_zmq_socket(
-        ctx,
-        client_config["input_address"],
-        zmq.ROUTER,
-        bind=True,
-        listener=client_config["input_listener"],
-    )
-    pull = make_zmq_socket(
-        ctx,
-        client_config["output_address"],
-        zmq.PULL,
-        bind=True,
-        listener=client_config["output_listener"],
-    )
-    try:
-        identity, payload = router.recv_multipart()
-        assert payload == b"input"
-        assert pull.recv() == b"output"
-        router.send_multipart([identity, b"ok"])
-    finally:
-        router.close(linger=0)
-        pull.close(linger=0)
-        ctx.term()
 
 
 @pytest.fixture
@@ -80,7 +63,9 @@ def api_server_args():
         "target_server_fn": mock_run_api_server_worker,
         "listen_address": "localhost:8000",
         "sock": sock,
-        "args": "test_args",  # Simple string to avoid pickling issues
+        # Picklable stand-in for the CLI namespace. Spawned workers never see
+        # globals mutated in the parent, so the mock runtime travels in here.
+        "args": SimpleNamespace(runtime=WORKER_RUNTIME_SECONDS),
         "num_servers": 3,
         "input_listeners": [
             make_zmq_listener("tcp://127.0.0.1:0", zmq.ROUTER) for _ in range(3)
@@ -95,10 +80,6 @@ def api_server_args():
 @pytest.mark.parametrize("with_stats_update", [True, False])
 def test_api_server_process_manager_init(api_server_args, with_stats_update):
     """Test initializing the APIServerProcessManager."""
-    # Set the worker runtime to ensure tests complete in reasonable time
-    global WORKER_RUNTIME_SECONDS
-    WORKER_RUNTIME_SECONDS = 0.5
-
     # Copy the args to avoid mutating them
     args = api_server_args.copy()
 
@@ -122,7 +103,7 @@ def test_api_server_process_manager_init(api_server_args, with_stats_update):
             assert proc.is_alive()
 
         print("Waiting for processes to run...")
-        time.sleep(WORKER_RUNTIME_SECONDS / 2)
+        time.sleep(0.5)
 
         # They should still be alive at this point
         for proc in manager.processes:
@@ -169,7 +150,7 @@ def test_api_server_child_adopts_inherited_zmq_listeners(tmp_path, scheme):
     _assert_endpoint_reserved(output_address)
     http_socket = socket.socket()
     manager = APIServerProcessManager(
-        target_server_fn=_adopt_zmq_listener_worker,
+        target_server_fn=adopt_zmq_listener_worker,
         listen_address="localhost:8000",
         sock=http_socket,
         args="test_args",
@@ -183,7 +164,6 @@ def test_api_server_child_adopts_inherited_zmq_listeners(tmp_path, scheme):
         ctx, input_address, zmq.DEALER, bind=False, identity=b"test"
     )
     push = make_zmq_socket(ctx, output_address, zmq.PUSH, bind=False)
-    dealer.setsockopt(zmq.RCVTIMEO, 30_000)
     try:
         assert input_listener.socket.fileno() == -1
         assert output_listener.socket.fileno() == -1
@@ -194,9 +174,13 @@ def test_api_server_child_adopts_inherited_zmq_listeners(tmp_path, scheme):
         _assert_endpoint_reserved(output_address)
         dealer.send(b"input")
         push.send(b"output")
+        # The child imports vllm before it adopts the listeners and answers.
+        assert dealer.poll(int(IMPORTING_WORKER_TIMEOUT_S * 1000)), (
+            f"{manager.processes[0].name} did not answer within "
+            f"{IMPORTING_WORKER_TIMEOUT_S}s"
+        )
         assert dealer.recv() == b"ok"
-        manager.processes[0].join(timeout=10)
-        assert manager.processes[0].exitcode == 0
+        _join_all(manager.processes, IMPORTING_WORKER_TIMEOUT_S)
     finally:
         manager.shutdown()
         dealer.close(linger=0)
@@ -219,9 +203,7 @@ def test_api_server_processes_share_admission_stats(api_server_args):
     manager = APIServerProcessManager(**args)
 
     try:
-        for process in manager.processes:
-            process.join(timeout=30)
-            assert process.exitcode == 0
+        _join_all(manager.processes, IMPORTING_WORKER_TIMEOUT_S)
 
         assert [worker_args.results.get(timeout=5) for _ in range(3)] == [6] * 3
     finally:
@@ -233,9 +215,6 @@ def test_api_server_processes_share_admission_stats(api_server_args):
 @patch("vllm.v1.utils.run_api_server_worker_proc", mock_run_api_server_worker)
 def test_wait_for_completion_or_failure(api_server_args):
     """Test that wait_for_completion_or_failure works with failures."""
-    global WORKER_RUNTIME_SECONDS
-    WORKER_RUNTIME_SECONDS = 1.0
-
     # Create the manager
     manager = APIServerProcessManager(**api_server_args)
 
@@ -291,25 +270,14 @@ def test_wait_for_completion_or_failure(api_server_args):
 @pytest.mark.timeout(30)
 def test_normal_completion(api_server_args):
     """Test that wait_for_completion_or_failure works in normal completion."""
-    global WORKER_RUNTIME_SECONDS
-    WORKER_RUNTIME_SECONDS = 0.1
+    api_server_args["args"] = SimpleNamespace(runtime=0.1)
 
     # Create the manager
     manager = APIServerProcessManager(**api_server_args)
 
     try:
-        # Give processes time to terminate
-        # wait for processes to complete
-        remaining_processes = manager.processes.copy()
-        while remaining_processes:
-            for proc in remaining_processes:
-                if not proc.is_alive():
-                    remaining_processes.remove(proc)
-            time.sleep(0.1)
-
-        # Verify all processes have terminated
-        for i, proc in enumerate(manager.processes):
-            assert not proc.is_alive(), f"Process {i} still alive after terminate()"
+        # Wait for the workers to finish on their own
+        _join_all(manager.processes, MOCK_WORKER_EXIT_TIMEOUT_S)
 
         # Now call wait_for_completion_or_failure
         # since all processes have already
@@ -329,15 +297,19 @@ def test_normal_completion(api_server_args):
 @pytest.mark.timeout(30)
 def test_external_process_monitoring(api_server_args):
     """Test that wait_for_completion_or_failure handles additional processes."""
-    global WORKER_RUNTIME_SECONDS
-    prev_worker_runtime = WORKER_RUNTIME_SECONDS
-    WORKER_RUNTIME_SECONDS = 100
+    # Long-running workers, so only the termination below ends any of them
+    worker_args = SimpleNamespace(runtime=100)
+    api_server_args["args"] = worker_args
 
     # Create and start the external process
     # (simulates local_engine_manager or coordinator)
     spawn_context = multiprocessing.get_context("spawn")
     external_proc = spawn_context.Process(
-        target=mock_run_api_server_worker, name="MockExternalProcess"
+        target=mock_run_api_server_worker,
+        name="MockExternalProcess",
+        args=(None, None, worker_args),
+        # Started before the try/finally below; never outlive the test.
+        daemon=True,
     )
     external_proc.start()
 
@@ -411,7 +383,6 @@ def test_external_process_monitoring(api_server_args):
         manager.shutdown()
         mock_coordinator.shutdown()
         time.sleep(0.2)
-        WORKER_RUNTIME_SECONDS = prev_worker_runtime
 
 
 def test_rust_frontend_launch_log_redacts_credentials(monkeypatch):
