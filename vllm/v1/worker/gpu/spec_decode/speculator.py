@@ -64,6 +64,19 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
     return hasattr(target_cls, "get_mtp_target_hidden_states")
 
 
+def _has_shardq_metadata(attn_metadata: dict[str, Any], layer_names: set[str]) -> bool:
+    """Whether any of these layers got ShardQ data in their attention metadata
+    (sparse MLA's `shardq` or the DSA indexer's `shardq_gather_indices`)."""
+    for name in layer_names:
+        metadata = attn_metadata.get(name)
+        if getattr(metadata, "shardq", None) is not None:
+            return True
+        prefill = getattr(metadata, "prefill", None)
+        if getattr(prefill, "shardq_gather_indices", None) is not None:
+            return True
+    return False
+
+
 class BaseSpeculator(ABC):
     """Base class for V2 model runner speculators.
 
@@ -416,7 +429,12 @@ class DraftModelSpeculator(BaseSpeculator):
         builders from the block tables and slot mappings the target prepared.
         Must run before draft decode steps overwrite the slot mappings.
         """
-        if self.can_reuse_target_attn_metadata:
+        # Draft layers are never ShardQ-eligible (MTP draft steps reuse each
+        # token slot's top-k rows), but on a token-sharded step a builder they
+        # share with eligible target layers hands them ShardQ metadata too.
+        if self.can_reuse_target_attn_metadata and not _has_shardq_metadata(
+            attn_metadata, self.draft_attn_layer_names
+        ):
             return attn_metadata, slot_mappings
         block_tables = tuple(
             block_table[: input_batch.num_reqs_after_padding]

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +10,9 @@ import pytest
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonMetadata,
+)
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.model_executor.models.exaone4_5_mtp import Exaone4_5_MTP
 from vllm.model_executor.models.llama4_eagle import EagleLlama4ForCausalLM
@@ -19,7 +23,12 @@ from vllm.model_executor.models.mistral_large_3_eagle import (
 )
 from vllm.v1.attention.backends import flash_attn as flash_attn_module
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillMetadata,
+)
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.ops.shardq import ShardQMetadata
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -686,6 +695,7 @@ def test_rebuilt_prefill_metadata_uses_target_batch_slots():
     # Under DBO the target builds only per-microbatch metadata, so the drafter
     # rebuilds the full batch's on its own builders from the target's slots.
     speculator = object.__new__(_TestSpeculator)
+    speculator.draft_attn_layer_names = {"draft"}
     target = ({"draft": "target metadata"}, {"draft": torch.zeros(6)})
     assert speculator._build_drafter_attn_metadata(None, *target) == target
 
@@ -715,6 +725,78 @@ def test_rebuilt_prefill_metadata_uses_target_batch_slots():
     assert target_slots.data_ptr() == speculator.block_tables.slot_mappings.data_ptr()
     assert target_slots.shape == (1, 6)
     assert slot_mappings["draft"].tolist() == list(range(6))
+
+
+@pytest.mark.parametrize("sharded_layer", [None, "mtp.attn", "mtp.indexer"])
+def test_draft_prefill_rebuilds_token_sharded_metadata(sharded_layer):
+    # MTP layers are not ShardQ-eligible: their draft steps reuse each token
+    # slot's top-k row. On a token-sharded step, builders they share with
+    # eligible target layers still hand them ShardQ metadata, so the drafter
+    # must rebuild it on its own builders.
+    ids = torch.zeros(4, dtype=torch.int32)
+    shardq = ShardQMetadata(
+        num_decode_tokens=0,
+        num_tokens_per_rank=[2, 2],
+        token_ids=torch.arange(4),
+        rank_offsets=torch.tensor([0, 2, 4]),
+    )
+    attn = SparseMLACommonMetadata(
+        num_reqs=1,
+        max_query_len=4,
+        max_seq_len=4,
+        num_actual_tokens=4,
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        slot_mapping=ids,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        block_table=ids.view(1, 4),
+        req_id_per_token=ids,
+    )
+    # Set as build_shardq_metadata does; the dataclass repr reads it.
+    shardq.attn_metadata = attn
+    mtp_shardq = shardq if sharded_layer == "mtp.attn" else None
+    gather_indices = torch.arange(2) if sharded_layer == "mtp.indexer" else None
+    target_metadata = {
+        "target.attn": replace(attn, shardq=shardq),
+        "mtp.attn": replace(attn, shardq=mtp_shardq),
+        "mtp.indexer": DeepseekV32IndexerMetadata(
+            seq_lens=ids[:1],
+            max_seq_len=4,
+            slot_mapping=ids,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_prefills=1,
+            num_prefill_tokens=4,
+            prefill=DeepseekV32IndexerPrefillMetadata(
+                chunks=[], shardq_gather_indices=gather_indices
+            ),
+        ),
+    }
+
+    speculator = object.__new__(_TestSpeculator)
+    speculator.draft_attn_layer_names = {"mtp.attn", "mtp.indexer"}
+    speculator.attn_groups = [[Mock()]]
+    speculator.model_state = Mock()
+    speculator.model_state.prepare_attn.return_value = {"mtp.attn": "rebuilt"}
+    speculator.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=list(target_metadata))]
+    )
+    speculator.block_tables = SimpleNamespace(
+        input_block_tables=[ids.view(1, 4)], slot_mappings=ids.view(1, 4)
+    )
+    input_batch = SimpleNamespace(num_reqs_after_padding=1, num_tokens_after_padding=4)
+
+    attn_metadata, _ = speculator._build_drafter_attn_metadata(
+        input_batch, target_metadata, {name: ids for name in target_metadata}
+    )
+
+    if sharded_layer is None:
+        assert attn_metadata is target_metadata
+    else:
+        assert attn_metadata == {"mtp.attn": "rebuilt"}
+        _, _, _, _, attn_groups, _ = speculator.model_state.prepare_attn.call_args.args
+        assert attn_groups is speculator.attn_groups
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
