@@ -159,6 +159,14 @@ def _wait_for_prefix_cache_reset(llm: LLM, reset_connector: bool = False) -> Non
         )
 
 
+def _offloaded_block_size(llm: LLM) -> int:
+    vllm_config = llm.llm_engine.vllm_config
+    extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+    # No custom offloaded block_size: offloaded blocks match GPU blocks.
+    # Use the hash block_size (cache_config.block_size) for alignment.
+    return extra_config.get("block_size") or vllm_config.cache_config.block_size
+
+
 def _latency_test(llm: LLM, subscriber: MockSubscriber | None):
     # TODO: Reintroduce latency test on ROCm once MRV2 supports cross
     # layer KV Cache. See https://github.com/vllm-project/vllm/pull/45947
@@ -172,8 +180,11 @@ def _latency_test(llm: LLM, subscriber: MockSubscriber | None):
     total_gpu_hit_time = 0.0
     total_cpu_hit_time = 0.0
     max_model_len = llm.llm_engine.vllm_config.model_config.max_model_len
-    # Use a long prompt that fits within the model's context window.
-    prompt_len = min(10001, max_model_len - 1)
+    # Use a long prompt that fits within the model's context window. End it
+    # one token past a whole offloaded block so a hit leaves only the final
+    # token to recompute, whatever the block size (Falcon-H1's is 832).
+    block_size = _offloaded_block_size(llm)
+    prompt_len = (min(10001, max_model_len - 1) - 1) // block_size * block_size + 1
     prompt_token_ids = [0] * prompt_len
     for i in tqdm(range(num_tests), desc="Running tests"):
         prompt_token_ids[0] = i
@@ -222,14 +233,7 @@ def _latency_test(llm: LLM, subscriber: MockSubscriber | None):
 
 def _accuracy_test(llm: LLM, subscriber: MockSubscriber | None):
     sampling_params = SamplingParams(max_tokens=1)
-    extra_config = (
-        llm.llm_engine.vllm_config.kv_transfer_config.kv_connector_extra_config
-    )
-    cpu_block_size = extra_config.get("block_size")
-    if cpu_block_size is None:
-        # No custom offloaded block_size: offloaded blocks match GPU blocks.
-        # Use the hash block_size (cache_config.block_size) for alignment.
-        cpu_block_size = llm.llm_engine.vllm_config.cache_config.block_size
+    cpu_block_size = _offloaded_block_size(llm)
 
     if subscriber is not None:
         subscriber.get_new_cpu_stored_events()
