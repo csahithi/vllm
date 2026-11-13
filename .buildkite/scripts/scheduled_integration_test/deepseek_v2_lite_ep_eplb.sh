@@ -27,6 +27,10 @@ if command -v rocm-smi &> /dev/null || [[ -d /opt/rocm ]] || [[ -n "${ROCM_PATH:
 else
   # Non-ROCm platform (CUDA/other)
   BACKENDS=("deepep_high_throughput" "deepep_low_latency")
+  # Single node: NVSHMEM reaches peers over NVLink, so keep it off the NICs.
+  # DeepEP forces IBGDA on, so also hide the NICs from it.
+  export NVSHMEM_REMOTE_TRANSPORT=none
+  export NVSHMEM_HCA_LIST=none
 fi
 
 cleanup() {

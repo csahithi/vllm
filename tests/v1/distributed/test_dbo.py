@@ -46,6 +46,13 @@ DEEPEP_BACKENDS = [
     "deepep_high_throughput",
 ]
 
+# Single node: NVSHMEM reaches the DP peer over NVLink, so keep it off the NICs.
+DEEPEP_SINGLE_NODE_NVSHMEM_ENV = {
+    "NVSHMEM_REMOTE_TRANSPORT": "none",
+    # DeepEP forces IBGDA on, so also hide the NICs from it.
+    "NVSHMEM_HCA_LIST": "none",
+}
+
 
 @pytest.mark.skipif(not has_deep_ep(), reason="These tests require deep_ep to run")
 @pytest.mark.parametrize("all2all_backend", DEEPEP_BACKENDS)
@@ -128,6 +135,7 @@ def _run_dbo_gsm8k(
     with RemoteOpenAIServer(
         MODEL_NAME,
         server_args,
+        env_dict=DEEPEP_SINGLE_NODE_NVSHMEM_ENV,
         max_wait_seconds=600,  # Allow time for model loading with DP+EP
     ) as remote_server:
         # Use host and port directly from RemoteOpenAIServer
