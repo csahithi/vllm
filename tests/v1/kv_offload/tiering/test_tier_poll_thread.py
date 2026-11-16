@@ -86,8 +86,10 @@ class _FakeTier(SecondaryTierManager):
         pass
 
     def serve_external_requests(self, parent: ParentManager) -> None:
-        self.serves += 1
+        # Record the thread first: a reader that sees serves rise must also
+        # see who served.
         self.serve_threads.add(threading.get_ident())
+        self.serves += 1
         if self.on_serve is not None:
             self.on_serve(parent)
         self.served.set()
@@ -184,15 +186,17 @@ def test_serves_while_the_scheduler_is_outside_the_lock(manager_and_tier):
     with manager.lock:
         manager.on_schedule_end(_EMPTY_SCHEDULE_END)
 
-    tier.served.clear()
     serves_before = tier.serves
 
     # Stand in for future.result(): the engine thread is blocked, holding
-    # nothing.
-    assert tier.served.wait(_SETTLE_S), (
+    # nothing. Wait on the count itself: a serve already in flight can set
+    # tier.served after a clear() without adding to it.
+    deadline = time.monotonic() + _SETTLE_S
+    while tier.serves <= serves_before and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert tier.serves > serves_before, (
         "tier was not serviced while the scheduler held no lock"
     )
-    assert tier.serves > serves_before
     assert tier.polls > 0
 
     scheduler_thread_id = threading.get_ident()
