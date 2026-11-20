@@ -618,15 +618,18 @@ def check_deferred_moe_finalize(
     run: Callable[[], torch.Tensor | UnfinalizedMoEOutput],
     router_weights: torch.Tensor | None = None,
     chunked: bool = False,
+    atol: float = 0.0,
+    rtol: float = 0.0,
 ) -> None:
     """Check a kernel that defers its finalize against the finalize it skips.
 
     `run` calls the kernel on fixed inputs, first as built and then with
     `moe_config` asking to defer, which `should_defer_moe_finalize` must
     report truthfully. A deferred output reduced by `moe_unpermute`, the
-    TRT-LLM finalize kernel, must give the kernel's own finalized output bit for
-    bit, and modular experts hand the router's weights back as-is. A call the
-    experts split across kernel launches finalizes instead.
+    TRT-LLM finalize kernel, must give the kernel's own finalized output within
+    `atol` and `rtol` (bit for bit by default), and modular experts hand the
+    router's weights back as-is. A call the experts split across kernel
+    launches finalizes instead.
     """
     # The deferred output views the router's buffer, so compare with a copy.
     expected_weights = None if router_weights is None else router_weights.clone()
@@ -655,7 +658,7 @@ def check_deferred_moe_finalize(
             (1,), output.gemm2_permuted.shape[0], dtype=torch.int64
         ),
     )
-    torch.testing.assert_close(reference, finalized, atol=0, rtol=0)
+    torch.testing.assert_close(reference, finalized, atol=atol, rtol=rtol)
 
 
 def mxfp4_w_layouts(mx_axis: int, num_warps: int = 8):

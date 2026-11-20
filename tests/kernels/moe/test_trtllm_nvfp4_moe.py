@@ -698,6 +698,12 @@ def test_trtllm_fp4_moe_deferred_finalize(
             ),
             router_weights=topk_weights,
             chunked=chunk_size is not None,
+            # For top-k > 4, FlashInfer's small-batch finalize sums the top-k in
+            # interleaved groups (flashinfer-ai/flashinfer#6546) while
+            # `moe_unpermute` sums them in order, so outputs can round apart:
+            # rtol covers the bf16 rounding, atol the fp32 reordering near zero.
+            atol=2**-20,
+            rtol=2**-7,
         )
 
 
