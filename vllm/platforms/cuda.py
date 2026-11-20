@@ -7,9 +7,11 @@ pynvml. However, it should not initialize cuda context.
 from __future__ import annotations
 
 import contextlib
+import multiprocessing
 import os
 import platform
 from collections.abc import Callable
+from concurrent.futures.process import ProcessPoolExecutor
 from datetime import timedelta
 from functools import cache, lru_cache, wraps
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
@@ -24,7 +26,7 @@ import vllm._C_stable_libtorch  # noqa
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
-from vllm.utils.platform_utils import cuda_get_device_properties
+from vllm.utils.platform_utils import cuda_get_device_properties, cuda_is_initialized
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interface import DeviceCapability, Platform, PlatformEnum, in_wsl
@@ -204,6 +206,73 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
             pynvml.nvmlShutdown()
 
     return wrapper
+
+
+def _all_cuda_device_uuids() -> list[str]:
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    return [
+        str(torch.cuda.get_device_properties(i).uuid)
+        for i in range(torch.cuda.device_count())
+    ]
+
+
+def _cuda_device_uuids_in_enumeration_order() -> list[str]:
+    """UUIDs of all CUDA devices in the order integer CUDA_VISIBLE_DEVICES
+    entries index them, queried in a forked process so that CUDA is not
+    initialized in this one."""
+    mp_ctx = multiprocessing.get_context("fork")
+    with ProcessPoolExecutor(max_workers=1, mp_context=mp_ctx) as executor:
+        return executor.submit(_all_cuda_device_uuids).result()
+
+
+@lru_cache(maxsize=8)
+@with_nvml_context
+def _cuda_index_to_nvml_index_map(
+    cuda_device_order: str | None, cuda_visible_devices: str | None
+) -> dict[int, int] | None:
+    """NVML index of each CUDA enumeration index, or None if they are equal.
+
+    NVML numbers GPUs by PCI bus ID. CUDA does the same only under
+    CUDA_DEVICE_ORDER=PCI_BUS_ID; by default it puts the fastest GPU first,
+    which reorders GPUs on hosts that mix models (e.g. the GB300 and display
+    GPU of a DGX Station).
+    """
+    if cuda_device_order == "PCI_BUS_ID":
+        return None
+    try:
+        names = {
+            pynvml.nvmlDeviceGetName(pynvml.nvmlDeviceGetHandleByIndex(i))
+            for i in range(pynvml.nvmlDeviceGetCount())
+        }
+        if len(names) <= 1:
+            return None
+        if cuda_is_initialized():
+            # Only visible devices can be queried in-process; key each by the
+            # enumeration index its integer CUDA_VISIBLE_DEVICES entry names.
+            entries = cuda_visible_devices.split(",") if cuda_visible_devices else None
+            uuids = {}
+            for ordinal in range(torch.cuda.device_count()):
+                entry = entries[ordinal].strip() if entries else str(ordinal)
+                if entry.isdigit():
+                    props = torch.cuda.get_device_properties(ordinal)
+                    uuids[int(entry)] = str(props.uuid)
+        else:
+            uuids = dict(enumerate(_cuda_device_uuids_in_enumeration_order()))
+        return {
+            index: pynvml.nvmlDeviceGetIndex(
+                pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}")
+            )
+            for index, uuid in uuids.items()
+        }
+    except Exception as e:
+        logger.warning_once(
+            "Could not map CUDA device indices to NVML (%s), so device "
+            "queries may describe a different GPU than the one in use. Set "
+            "CUDA_VISIBLE_DEVICES to GPU UUIDs (see `nvidia-smi -L`) to avoid "
+            "this.",
+            str(e),
+        )
+        return None
 
 
 @with_nvml_context
@@ -815,10 +884,30 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @with_nvml_context
     def device_control_id_to_physical_device_id(cls, device_id: str) -> int:
         try:
-            return int(device_id)
+            index = int(device_id)
         except ValueError:
             handle = pynvml.nvmlDeviceGetHandleByUUID(device_id)
             return pynvml.nvmlDeviceGetIndex(handle)
+        return cls.enumeration_index_to_physical_device_id(index)
+
+    @classmethod
+    def _enumeration_index_map(cls) -> dict[int, int] | None:
+        return _cuda_index_to_nvml_index_map(
+            os.environ.get("CUDA_DEVICE_ORDER"),
+            os.environ.get(cls.device_control_env_var),
+        )
+
+    @classmethod
+    def enumeration_index_to_physical_device_id(cls, index: int) -> int:
+        index_map = cls._enumeration_index_map()
+        return index if index_map is None else index_map.get(index, index)
+
+    @classmethod
+    def physical_device_id_to_enumeration_index(cls, physical_device_id: int) -> int:
+        for index, nvml_index in (cls._enumeration_index_map() or {}).items():
+            if nvml_index == physical_device_id:
+                return index
+        return physical_device_id
 
     @classmethod
     @cache
@@ -1058,9 +1147,10 @@ class NvmlCudaPlatform(CudaPlatformBase):
                 and os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID"
             ):
                 logger.warning_once(
-                    "Detected different devices in the system: %s. Please"
-                    " make sure to set `CUDA_DEVICE_ORDER=PCI_BUS_ID` to "
-                    "avoid unexpected behavior.",
+                    "Detected different devices in the system: %s. CUDA "
+                    "orders them fastest first, so CUDA device indices may "
+                    "not match nvidia-smi. To select GPUs, set "
+                    "CUDA_VISIBLE_DEVICES to their UUIDs (`nvidia-smi -L`).",
                     ", ".join(device_names),
                     scope="process",
                 )

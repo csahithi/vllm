@@ -279,12 +279,13 @@ class Platform:
     def device_control_id_to_physical_device_id(cls, device_id: str) -> int:
         """Map one device-control env entry to an integer physical device ID."""
         try:
-            return int(device_id)
+            index = int(device_id)
         except ValueError as e:
             raise ValueError(
                 f"Non-integer device ID {device_id!r} is not supported by "
                 f"{cls.device_name}."
             ) from e
+        return cls.enumeration_index_to_physical_device_id(index)
 
     # GPU device IDs can refer to three distinct namespaces:
     # - logical: vLLM-local IDs such as local ranks. These index
@@ -293,8 +294,23 @@ class Platform:
     #   the device-control env var, e.g. CUDA_VISIBLE_DEVICES.
     # - physical: global GPU IDs used by topology and management APIs such as
     #   NVML, which are not remapped by CUDA_VISIBLE_DEVICES.
+    # Integer env-var entries, and visible IDs when the env var is unset, are
+    # indices into the runtime's device enumeration, which may order devices
+    # differently from the physical IDs; see
+    # enumeration_index_to_physical_device_id().
     # Keep conversions explicit. In particular, torch device indices are
     # visible IDs, not vLLM logical IDs.
+
+    @classmethod
+    def enumeration_index_to_physical_device_id(cls, index: int) -> int:
+        """Map an index into the runtime's full device enumeration to a
+        physical device ID."""
+        return index
+
+    @classmethod
+    def physical_device_id_to_enumeration_index(cls, physical_device_id: int) -> int:
+        """Inverse of enumeration_index_to_physical_device_id()."""
+        return physical_device_id
 
     @classmethod
     def device_id_to_physical_device_id(cls, device_id: int):
@@ -324,7 +340,7 @@ class Platform:
             physical_device_id = device_ids[device_id]
             return cls.device_control_id_to_physical_device_id(physical_device_id)
         else:
-            return device_id
+            return cls.enumeration_index_to_physical_device_id(device_id)
 
     @classmethod
     def logical_device_id_to_visible_device_id(cls, device_id: int) -> int:
@@ -338,7 +354,7 @@ class Platform:
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
         device_control_env = os.environ.get(cls.device_control_env_var, "")
         if not device_control_env:
-            return physical_device_id
+            return cls.physical_device_id_to_enumeration_index(physical_device_id)
 
         visible_physical_device_ids = [
             cls.device_control_id_to_physical_device_id(physical_id)
@@ -363,7 +379,7 @@ class Platform:
         """
         device_control_env = os.environ.get(cls.device_control_env_var, "")
         if not device_control_env:
-            return device_id
+            return cls.enumeration_index_to_physical_device_id(device_id)
         visible_device_ids = device_control_env.split(",")
         if device_id >= len(visible_device_ids):
             raise IndexError(

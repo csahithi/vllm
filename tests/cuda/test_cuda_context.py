@@ -196,5 +196,108 @@ def test_has_device_capability_comparisons(monkeypatch):
         NvmlCudaPlatform.get_device_capability.cache_clear()
 
 
+# DGX Station layout: NVML (PCI order) lists the display GPU first, while CUDA's
+# default fastest-first order makes the GB300 device 0.
+_STATION_NVML = [("RTX PRO 4000", (12, 0), "rtx"), ("GB300", (10, 3), "gb300")]
+
+
+@pytest.fixture
+def station_nvml(monkeypatch):
+    import vllm.platforms.cuda as cuda_platform
+    from vllm.platforms.cuda import NvmlCudaPlatform, pynvml
+
+    probes = {"count": 0}
+    gpus = list(_STATION_NVML)
+
+    def cuda_uuids() -> list[str]:
+        probes["count"] += 1
+        return ["gb300", "rtx"]
+
+    for name, fn in {
+        "nvmlInit": lambda: None,
+        "nvmlShutdown": lambda: None,
+        "nvmlDeviceGetCount": lambda: len(gpus),
+        "nvmlDeviceGetHandleByIndex": lambda i: i,
+        "nvmlDeviceGetIndex": lambda handle: handle,
+        "nvmlDeviceGetHandleByUUID": lambda uuid: [g[2] for g in gpus].index(
+            uuid.removeprefix("GPU-")
+        ),
+        "nvmlDeviceGetName": lambda handle: gpus[handle][0],
+        "nvmlDeviceGetCudaComputeCapability": lambda handle: gpus[handle][1],
+    }.items():
+        monkeypatch.setattr(pynvml, name, fn)
+    monkeypatch.setattr(cuda_platform, "cuda_is_initialized", lambda: False)
+    monkeypatch.setattr(
+        cuda_platform, "_cuda_device_uuids_in_enumeration_order", cuda_uuids
+    )
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    monkeypatch.delenv(NvmlCudaPlatform.device_control_env_var, raising=False)
+
+    def clear():
+        cuda_platform._cuda_index_to_nvml_index_map.cache_clear()
+        NvmlCudaPlatform.get_device_capability.cache_clear()
+
+    clear()
+    yield gpus, probes
+    clear()
+
+
+@pytest.mark.parametrize(
+    ("cuda_visible_devices", "expected_name", "expected_capability"),
+    [
+        (None, "GB300", (10, 3)),
+        ("0", "GB300", (10, 3)),
+        ("1", "RTX PRO 4000", (12, 0)),
+    ],
+)
+def test_device_queries_follow_cuda_order_on_mixed_gpus(
+    station_nvml,
+    monkeypatch,
+    cuda_visible_devices,
+    expected_name,
+    expected_capability,
+):
+    """Device queries must describe the GPU torch runs on, before CUDA init.
+
+    Integer CUDA_VISIBLE_DEVICES entries and unset-env ordinals index CUDA's
+    enumeration, not NVML's PCI order.
+    """
+    from vllm.platforms.cuda import NvmlCudaPlatform
+
+    if cuda_visible_devices is not None:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", cuda_visible_devices)
+
+    assert NvmlCudaPlatform.get_device_name(0) == expected_name
+    assert NvmlCudaPlatform.get_device_capability(0) == expected_capability
+
+
+def test_physical_device_id_maps_to_cuda_ordinal_on_mixed_gpus(
+    station_nvml, monkeypatch
+):
+    """`--device-ids 1` (nvidia-smi index of the GB300) must select cuda:0."""
+    import vllm.platforms.interface as platform_interface
+    from vllm.platforms.cuda import NvmlCudaPlatform
+
+    monkeypatch.setattr(platform_interface, "_assigned_physical_gpu_ids", [1])
+
+    assert NvmlCudaPlatform.logical_device_id_to_visible_device_id(0) == 0
+
+
+@pytest.mark.parametrize("case", ["pci_bus_id_order", "same_model"])
+def test_device_order_probe_skipped_when_orders_agree(station_nvml, monkeypatch, case):
+    """CUDA and NVML order agree here, so no probe runs and ids map 1:1."""
+    from vllm.platforms.cuda import NvmlCudaPlatform
+
+    gpus, probes = station_nvml
+    if case == "pci_bus_id_order":
+        monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    else:
+        gpus[:] = [("B200", (10, 0), "b200-0"), ("B200", (10, 0), "b200-1")]
+
+    assert NvmlCudaPlatform.visible_device_id_to_physical_device_id(0) == 0
+    assert NvmlCudaPlatform.logical_device_id_to_visible_device_id(1) == 1
+    assert probes["count"] == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

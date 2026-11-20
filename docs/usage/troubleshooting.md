@@ -347,6 +347,16 @@ But you are sure that the model is in the [list of supported models](../models/s
 
 If you see an error like `RuntimeError: Failed to infer device type`, it means that vLLM failed to infer the device type of the runtime environment. You can check [the code](../../vllm/platforms/__init__.py) to see how vLLM infers the device type and why it is not working as expected. After [this PR](https://github.com/vllm-project/vllm/pull/14195), you can also set the environment variable `VLLM_LOGGING_LEVEL=DEBUG` to see more detailed logs to help debug the issue.
 
+## Selecting a GPU on hosts with different GPU models
+
+On a host that mixes GPU models, such as a DGX Station (a GB300 plus an RTX PRO display GPU), CUDA numbers the GPUs fastest first, while `nvidia-smi` numbers them by PCI bus ID. vLLM follows CUDA's numbering: device 0 and integer `CUDA_VISIBLE_DEVICES` entries refer to CUDA's order, so `CUDA_VISIBLE_DEVICES=0` selects the fastest GPU even if `nvidia-smi` lists it second. Setting `CUDA_DEVICE_ORDER=PCI_BUS_ID` makes the two orders match, but on a DGX Station it also makes the display GPU device 0.
+
+To select a GPU unambiguously, use its UUID from `nvidia-smi -L`:
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU-<uuid> vllm serve <model>
+```
+
 ## NCCL error: unhandled system error during `ncclCommInitRank`
 
 If your serving workload uses GPUDirect RDMA for distributed serving across multiple nodes and encounters an error during `ncclCommInitRank`, with no clear error message even with `NCCL_DEBUG=INFO` set, it might look like this:
