@@ -63,11 +63,14 @@ NIGHTLY_FINAL_BASE_IMAGE="nvidia/cuda:${NIGHTLY_CUDA_VERSION}-base-ubuntu${NIGHT
 echo "--- :docker: Building torch nightly image (CUDA ${NIGHTLY_CUDA_VERSION})"
 # Provenance labels match the bake `_labels` target in docker/docker-bake.hcl;
 # the initialized-snapshot E2E refuses images whose commit labels differ.
+# An empty NCCL_VERSION skips the Dockerfile's NCCL override, so torch nightly
+# keeps the NCCL it was built against.
 docker buildx build --file docker/Dockerfile \
   --build-arg max_jobs=16 \
   --build-arg buildkite_commit="$BUILDKITE_COMMIT" \
   --build-arg USE_SCCACHE=1 \
   --build-arg PYTORCH_NIGHTLY=1 \
+  --build-arg NCCL_VERSION= \
   --build-arg CUDA_VERSION="${NIGHTLY_CUDA_VERSION}" \
   --build-arg BUILD_BASE_IMAGE="${NIGHTLY_BUILD_BASE_IMAGE}" \
   --build-arg FINAL_BASE_IMAGE="${NIGHTLY_FINAL_BASE_IMAGE}" \

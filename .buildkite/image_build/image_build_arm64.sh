@@ -16,7 +16,8 @@ BUILDKITE_COMMIT=$3
 PYTORCH_NIGHTLY_ARGS=()
 if [[ "${TORCH_NIGHTLY:-0}" == "1" ]]; then
   IMAGE="$REGISTRY/$REPO:$BUILDKITE_COMMIT-torch-nightly-arm64"
-  PYTORCH_NIGHTLY_ARGS=(--build-arg PYTORCH_NIGHTLY=1)
+  # Keep torch nightly's own NCCL; see image_build_torch_nightly.sh.
+  PYTORCH_NIGHTLY_ARGS=(--build-arg PYTORCH_NIGHTLY=1 --build-arg NCCL_VERSION=)
 else
   IMAGE="$REGISTRY/$REPO:$BUILDKITE_COMMIT-arm64"
 fi
