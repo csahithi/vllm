@@ -760,7 +760,8 @@ class SupportsLoRA(Protocol):
 
     Note:
         There is no need to redefine this flag if this class is in the
-        MRO of your model class.
+        MRO of your model class. A subclass of such a model can set it to
+        `False` to opt out.
     """
     is_3d_moe_weight: ClassVar[bool] = False
     is_non_gated_moe: ClassVar[bool] = False
@@ -794,6 +795,9 @@ def supports_lora(model: object) -> TypeIs[SupportsLoRA]: ...
 def supports_lora(
     model: type[object] | object,
 ) -> TypeIs[type[SupportsLoRA]] | TypeIs[SupportsLoRA]:
+    if getattr(model, "supports_lora", None) is False:
+        return False
+
     result = _supports_lora(model)
 
     if not result:
@@ -848,7 +852,8 @@ class SupportsPP(Protocol):
 
     Note:
         There is no need to redefine this flag if this class is in the
-        MRO of your model class.
+        MRO of your model class. A subclass of such a model can set it to
+        `False` to opt out.
     """
 
     make_empty_intermediate_tensors: _MakeEmptyIntermediateTensors
@@ -898,6 +903,9 @@ def supports_pp(model: object) -> TypeIs[SupportsPP]: ...
 def supports_pp(
     model: type[object] | object,
 ) -> bool | TypeIs[type[SupportsPP]] | TypeIs[SupportsPP]:
+    if getattr(model, "supports_pp", None) is False:
+        return False
+
     supports_attributes = _supports_pp_attributes(model)
     supports_inspect = _supports_pp_inspect(model)
 

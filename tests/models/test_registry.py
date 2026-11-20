@@ -124,6 +124,8 @@ def test_registry_model_property(model_arch, is_mm, score_type):
     [
         ("DeepseekV2ForCausalLM", True),
         ("Qwen2VLForConditionalGeneration", True),
+        # Sets `supports_pp = False` over its parent's `SupportsPP`.
+        ("HYV4FlashForCausalLM", False),
     ],
 )
 def test_registry_is_pp(model_arch, is_pp):
@@ -131,6 +133,21 @@ def test_registry_is_pp(model_arch, is_pp):
     assert model_info is not None
 
     assert model_info.supports_pp is is_pp
+
+
+@pytest.mark.parametrize(
+    "model_arch,is_lora",
+    [
+        ("LlamaForCausalLM", True),
+        # Sets `supports_lora = False` over its parent's `SupportsLoRA`.
+        ("HYV4FlashForCausalLM", False),
+    ],
+)
+def test_registry_is_lora(model_arch, is_lora):
+    model_info = ModelRegistry._try_inspect_model_cls(model_arch)
+    assert model_info is not None
+
+    assert model_info.supports_lora is is_lora
 
 
 @pytest.mark.parametrize(
