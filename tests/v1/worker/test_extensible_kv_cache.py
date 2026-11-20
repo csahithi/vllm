@@ -245,13 +245,15 @@ def test_measure_kv_cache_bytes():
 def test_sizing_step_measures_torch_reserve_growth():
     """A step whose large transient no longer fits the segment freed by the
     previous one (split by a buffer the step keeps) grows torch's reservation
-    by both, while its allocated transient shows only one."""
+    by both, while its allocated transient shows only one, and records that
+    transient's 512 MiB segment."""
     from vllm.v1.worker.gpu.warmup import _measure_sizing_step
 
     mib = 1 << 20
     kv_cache = ExtensibleKVCache.__new__(ExtensibleKVCache)
     kv_cache.reserved_headroom_bytes = 0
     kv_cache.torch_reserve_growth_bytes = 0
+    kv_cache.transient_segment_bytes = 0
     kv_cache.buffer = SimpleNamespace(device=torch.device("cuda"))
     runner = SimpleNamespace(extensible_kv_cache=kv_cache, device=torch.device("cuda"))
     kept = []
@@ -265,6 +267,62 @@ def test_sizing_step_measures_torch_reserve_growth():
     assert kv_cache.reserved_headroom_bytes == 512 * mib
     # Two 512 MiB segments, less the 100 MiB the step leaves allocated.
     assert kv_cache.torch_reserve_growth_bytes == 924 * mib
+    assert kv_cache.transient_segment_bytes == 512 * mib
+
+
+def test_measured_sizing_leaves_torch_room_for_another_transient_segment(
+    monkeypatch,
+):
+    """Torch may grow by the measured growth plus one more segment of the
+    largest transient: serving can pin the segment a smaller step reserved for
+    it, as GLM-5.2-NVFP4 did with a 766 MiB MoE workspace in the B200 HiSparse
+    GSM8K nightly."""
+    gib, mib = 1 << 30, 1 << 20
+    monkeypatch.setattr(extensible_kv_cache, "KV_CACHE_MARGIN_FLOOR_BYTES", gib)
+    monkeypatch.setattr(
+        extensible_kv_cache, "KV_CACHE_NON_TORCH_RESERVE_BYTES", 512 * mib
+    )
+    limits: list[int | None] = []
+    kv_cache = SimpleNamespace(
+        reserved_headroom_bytes=gib,
+        torch_reserve_growth_bytes=1280 * mib,
+        transient_segment_bytes=766 * mib,
+        physical_bytes=10 * gib,
+        bytes_per_block=mib,
+        blocks_within=lambda num_bytes: num_bytes // mib,
+        physical_bytes_for=lambda num_blocks: num_blocks * mib,
+        set_torch_memory_limit=limits.append,
+    )
+    accelerator = extensible_kv_cache.torch.accelerator
+    monkeypatch.setattr(accelerator, "synchronize", lambda *args: None)
+    monkeypatch.setattr(accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(accelerator, "memory_reserved", lambda *args: 100 * gib)
+    monkeypatch.setattr(
+        extensible_kv_cache.current_platform,
+        "free_device_memory",
+        lambda device: 57 * gib,
+    )
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "reserve_mm_ipc_gpu_memory",
+        lambda available, *args: available,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=None),
+        parallel_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(gpu_memory_utilization=None),
+        kv_transfer_config=None,
+    )
+
+    extensible_kv_cache.measure_kv_cache_blocks(
+        kv_cache,  # type: ignore[arg-type]
+        vllm_config,  # type: ignore[arg-type]
+        torch.device("cpu"),
+        init_free_memory=170 * gib,
+        requested_memory=170 * gib,
+    )
+
+    assert limits == [100 * gib + 1280 * mib + 766 * mib]
 
 
 def test_measured_sizing_caps_torch_memory(monkeypatch):
@@ -276,6 +334,7 @@ def test_measured_sizing_caps_torch_memory(monkeypatch):
     kv_cache = SimpleNamespace(
         reserved_headroom_bytes=gib,
         torch_reserve_growth_bytes=0,
+        transient_segment_bytes=0,
         physical_bytes=gib,
         bytes_per_block=gib,
         blocks_within=lambda num_bytes: num_bytes // gib,
@@ -342,6 +401,7 @@ def test_measured_sizing_warns_when_utilization_withholds_memory(
     kv_cache = SimpleNamespace(
         reserved_headroom_bytes=0,
         torch_reserve_growth_bytes=0,
+        transient_segment_bytes=0,
         physical_bytes=gib,
         bytes_per_block=gib,
         blocks_within=lambda num_bytes: num_bytes // gib,
@@ -389,6 +449,7 @@ def test_measured_sizing_counts_reclaimable_memory_on_integrated_gpu(monkeypatch
     kv_cache = SimpleNamespace(
         reserved_headroom_bytes=7 * gib,
         torch_reserve_growth_bytes=0,
+        transient_segment_bytes=0,
         physical_bytes=gib,
         bytes_per_block=gib,
         blocks_within=lambda num_bytes: num_bytes // gib,

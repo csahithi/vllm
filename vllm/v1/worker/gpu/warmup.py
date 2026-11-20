@@ -446,13 +446,30 @@ def run_context_prefill_warmup(
     return True
 
 
+def _free_bytes_by_segment(device: torch.device) -> dict[int, int]:
+    """Unallocated bytes of each segment torch's caching allocator holds on
+    device, by address; empty for other allocator backends. Expandable
+    segments grow in place, so are left out."""
+    if torch.cuda.memory.get_allocator_backend() != "native":
+        return {}
+    index = device.index
+    if index is None:
+        index = torch.accelerator.current_device_index()
+    return {
+        segment["address"]: segment["total_size"] - segment["allocated_size"]
+        for segment in torch.cuda.memory_snapshot(include_traces=False)
+        if segment["device"] == index and not segment.get("is_expandable")
+    }
+
+
 @contextmanager
 def _measure_sizing_step(model_runner: GPUModelRunner) -> Iterator[None]:
     """Record how far a sizing step grows torch's reservation from an emptied
     cache, as serving starts once the cache is sized. Unlike the allocated
     peak, this includes fragmentation, e.g. a large per-layer workspace that
     no longer fits the segments freed around it. Allocations the step keeps
-    are not counted."""
+    are not counted. Also records the largest segment the step reserved for
+    its transients."""
     kv_cache = model_runner.extensible_kv_cache
     if kv_cache is None:
         yield
@@ -465,6 +482,7 @@ def _measure_sizing_step(model_runner: GPUModelRunner) -> Iterator[None]:
     stats = torch.accelerator.memory_stats(device)
     reserved_before = stats.get("reserved_bytes.all.current", 0)
     allocated_before = stats.get("allocated_bytes.all.current", 0)
+    segments_before = _free_bytes_by_segment(device).keys()
     yield
     stats = kv_cache.record_transient_peak()
     left_allocated = max(
@@ -473,6 +491,11 @@ def _measure_sizing_step(model_runner: GPUModelRunner) -> Iterator[None]:
     kv_cache.torch_reserve_growth_bytes = max(
         kv_cache.torch_reserve_growth_bytes,
         stats.get("reserved_bytes.all.peak", 0) - reserved_before - left_allocated,
+    )
+    segments = _free_bytes_by_segment(device)
+    new_segments = segments.keys() - segments_before
+    kv_cache.transient_segment_bytes = max(
+        [kv_cache.transient_segment_bytes, *(segments[a] for a in new_segments)]
     )
 
 

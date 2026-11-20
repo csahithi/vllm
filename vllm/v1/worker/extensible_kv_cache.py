@@ -115,6 +115,9 @@ class ExtensibleKVCache:
         # Largest growth of torch's reservation over a sizing step, which
         # includes fragmentation the allocated peak does not show.
         self.torch_reserve_growth_bytes = 0
+        # Most unallocated bytes in a segment a sizing step created, i.e. its
+        # largest transient's segment.
+        self.transient_segment_bytes = 0
         # Blocks warmup may commit: the minimum of `committable_blocks()` over
         # ranks when the cache is created.
         self.warmup_committable_blocks = 0
@@ -636,22 +639,33 @@ def measure_kv_cache_blocks(
     """Size an extensible KV cache from the memory free after warmup.
 
     Keeps free the larger of reserved_headroom_bytes (the profiled or warmup
-    allocated peak) and torch_reserve_growth_bytes. Torch's cache is emptied
-    first: its blocks may not fit the large workspaces the first real steps
-    allocate. Then caps torch's caching allocator to leave
-    KV_CACHE_NON_TORCH_RESERVE_BYTES free for allocations outside it.
+    allocated peak) and torch_reserve_growth_bytes, plus a margin that holds
+    KV_CACHE_NON_TORCH_RESERVE_BYTES and one more transient_segment_bytes.
+    Torch's cache is emptied first: its blocks may not fit the large
+    workspaces the first real steps allocate. Then caps torch's caching
+    allocator to leave KV_CACHE_NON_TORCH_RESERVE_BYTES free for allocations
+    outside it.
     """
     torch.accelerator.synchronize()
     gc.collect()
     torch.accelerator.empty_cache()
     free_memory = current_platform.free_device_memory(device)
     transient_peak = kv_cache.reserved_headroom_bytes
+    # The measured growth starts from an emptied cache. A step after a smaller
+    # one can find the segment that one reserved for its largest transient
+    # pinned by other blocks and too small, and reserve another. That room
+    # shares the floor's slack for fragmentation the sizing steps miss.
+    margin_floor = max(
+        KV_CACHE_MARGIN_FLOOR_BYTES,
+        kv_cache.transient_segment_bytes + KV_CACHE_NON_TORCH_RESERVE_BYTES,
+    )
     measured = dict(
         init_free_memory=init_free_memory,
         free_memory=free_memory,
         committed_bytes=kv_cache.physical_bytes,
         transient_peak_bytes=transient_peak,
         torch_reserve_growth_bytes=kv_cache.torch_reserve_growth_bytes,
+        margin_floor_bytes=margin_floor,
     )
     available = measure_kv_cache_bytes(requested_memory=requested_memory, **measured)
     utilization = vllm_config.cache_config.gpu_memory_utilization
@@ -700,13 +714,15 @@ def measure_kv_cache_blocks(
     logger.info(
         "Memory after warmup: %s GiB free, %s GiB committed to the KV cache, "
         "%s GiB kept for transient activations (%s GiB allocated at peak, "
-        "%s GiB of torch reservation growth); %d KV cache blocks (%s GiB) "
-        "fit within the requested %s GiB. Torch may reserve up to %s GiB.",
+        "%s GiB of torch reservation growth) with room for another %s GiB "
+        "transient segment; %d KV cache blocks (%s GiB) fit within the "
+        "requested %s GiB. Torch may reserve up to %s GiB.",
         format_gib(free_memory),
         format_gib(kv_cache.physical_bytes),
         format_gib(max(transient_peak, kv_cache.torch_reserve_growth_bytes)),
         format_gib(transient_peak),
         format_gib(kv_cache.torch_reserve_growth_bytes),
+        format_gib(kv_cache.transient_segment_bytes),
         num_blocks,
         format_gib(num_blocks * kv_cache.bytes_per_block),
         format_gib(requested_memory),
